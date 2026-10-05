@@ -357,14 +357,17 @@ def test_recover_recupera_los_repairing_de_un_worker_muerto(limpio):
 
     # De inmediato NO se recupera: un worker sano puede tardar 15 min con un hueco grande, y
     # reclamarselo seria tener dos workers escribiendo las mismas filas.
-    assert limpio.recuperar_zarandados(max_antiguedad_s=900.0) == 0
+    assert limpio.recuperar_zarandados(max_antiguedad_s=900.0, exchanges=["TESTEX"]) == 0
     assert limpio.claim(exchanges=["TESTEX"]) == [], "sin esperar, el hueco sigue tomado"
 
     # Al envejecer el umbral, vuelve a `open` y otro worker lo reclama.
     # El reloj se mueve por el parametro y no nullptr `updated_at` a mano: el trigger
     # `ingest_gaps_touch` hace `NEW.updated_at := now()` en cada UPDATE, asi que envejecer la
     # fila por SQL es imposible (se auto-repara en el acto).
-    assert limpio.recuperar_zarandados(max_antiguedad_s=-1.0) == 1
+    #
+    # El filtro `exchanges` es obligatorio aqui: con el umbral forzado a -1 y sin filtro, la
+    # recuperacion es GLOBAL y este test moveria huecos REALES del daemon de `repairing` a `open`.
+    assert limpio.recuperar_zarandados(max_antiguedad_s=-1.0, exchanges=["TESTEX"]) == 1
     assert propias(limpio)[0].status == "open"
     assert len(limpio.claim(exchanges=["TESTEX"])) == 1, "tras recuperar, el hueco se reclama"
 
@@ -383,7 +386,7 @@ def test_recover_solo_toca_repairing(limpio):
     limpio.finish(abierto, "partial", note="decision manual: no se reintenta solo")
     limpio.finish(tomado, "repaired", source="rest", rows=7)
 
-    assert limpio.recuperar_zarandados(max_antiguedad_s=-1.0) == 1
+    assert limpio.recuperar_zarandados(max_antiguedad_s=-1.0, exchanges=["TESTEX"]) == 1
     estados = {f.symbol: f.status for f in propias(limpio)}
     assert estados["ETHUSDT"] == "partial", estados
     assert estados["SOLUSDT"] == "repaired", estados

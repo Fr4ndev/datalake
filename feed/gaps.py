@@ -617,27 +617,38 @@ class GapLedger:
         conn.execute("UPDATE ingest_gaps SET status='open' WHERE id=%s AND status='repairing'", (gap_id,))
 
     # ------------------------------------------------------------------ worker
-    def recuperar_zarandados(self, max_antiguedad_s: float = 900.0) -> int:
+    def recuperar_zarandados(self, max_antiguedad_s: float = 900.0,
+                             exchanges: Iterable[str] | None = None) -> int:
         """Devuelve a `open` los `repairing` cuyo worker murio sin cerrar el hueco.
 
         `claim()` marca `repairing` y `finish()`/`release()` lo resuelven, asi que un worker al que
         matan entre medias (un `docker kill`, un OOM, un redeploy) deja el hueco **para siempre** en
         `repairing`: `claim` solo mira `status='open'`, asi que nadie vuelve a intentarlo y el hueco
         se queda sin reparar sin decir nada. Es la regla 15 justo en el punto donde no hay watchdog
-        que lo note.
+        que lo note. Medido: 41 huecos varados en `repairing` tras dos `docker kill`.
 
         Solo toca los que llevan mas de `max_antiguedad_s` en `repairing`: un worker sano puede
         tardar mas de 15 min con un hueco grande, y reclaimarselo seria tener dos workers
         escribiendo las mismas filas a la vez. La confianza en ese caso la da `SKIP LOCKED` del
         propio `claim`, no un reloj.
 
+        `exchanges` acota la recuperacion. Sin filtro es global, que es lo correcto en el worker
+        real (un worker puede morir con huecos de cualquier exchange en la mano), pero entonces un
+        test con reloj forzado moveria huecos REALES del daemon: los pasaria de `repairing` a `open`
+        sin que nadie lo haya pedido. Los tests filtran por sus exchanges.
+
         Devuelve cuantos ha rescatado, para que quede en el log.
         """
         conn = self._require()
+        params: list = [float(max_antiguedad_s)]
+        filtro = ""
+        if exchanges is not None:
+            filtro = " AND exchange = ANY(%s)"
+            params.append([canonico(e) for e in exchanges])
         cur = conn.execute(
             "UPDATE ingest_gaps SET status='open' WHERE status='repairing' "
-            "  AND updated_at < now() - make_interval(secs => %s) RETURNING id",
-            (float(max_antiguedad_s),))
+            "  AND updated_at < now() - make_interval(secs => %s)" + filtro + " RETURNING id",
+            tuple(params))
         ids = [r[0] for r in cur.fetchall()]
         if ids:
             log(component="gaps", event="repairing_recovered", count=len(ids),
@@ -656,10 +667,11 @@ class GapLedger:
         el test falla porque no era el suyo, y de paso el hueco de produccion queda eighteen horas
         esperando a que alguien lo reintente. Los tests filtran por sus exchanges de prueba.
 
-        Antes de reclamar llama a `recuperar_zarandados()`: sin eso, un worker muerto deja sus
-        huecos en `repairing` para siempre y este `WHERE status='open'` no los volveria a ver.
+        Antes de reclamar llama a `recuperar_zarandados()`, con el mismo filtro de `exchanges`: sin
+        eso, un worker muerto deja sus huecos en `repairing` para siempre y este
+        `WHERE status='open'` no los volveria a ver.
         """
-        self.recuperar_zarandados()
+        self.recuperar_zarandados(exchanges=exchanges)
         conn = self._require()
         out: list[Gap] = []
         with conn.transaction():
