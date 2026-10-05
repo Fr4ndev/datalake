@@ -1,0 +1,16 @@
+-- 51_retention_trades.sql :BORRAR SOLO ticks, NUNCA OHLCV ni el resto.
+--
+-- Decision (D31): el unico dato que se descarta es `trades`. Motivo: es el unico que no se puede
+-- recuperar (no existe en ningun historico) y el que mas filas genera; a 5 exchanges x 2 simbolos
+-- son ~10 M filas/dia y el disco del mini PC no lo aguanta indefinidamente.
+--
+-- Lo que NO se toca, y por que:
+--   - candles_1m, funding, open_interest, liquidations: su historico se recupera del lake
+--     (data.binance.vision / REST), asi que perderlos SI seria perdida real. Y en el caso de
+--     liquidaciones no hay otra fuente: el WS de Binance es parcial (~1 de cada 20).
+--   - En general, cualquier cosa que el loader pueda reponer desde el lake no se retentiona.
+--
+-- 180 dias es el punto de equilibrio: cubre un ciclo de backtest anual con margen y a la vez
+-- evita que el disco se llene. Si algun dia se amplia el numero de simbolos, este es el primer
+-- numero que hay que revisar.
+SELECT add_retention_policy('trades', INTERVAL '180 days', if_not_exists => TRUE);

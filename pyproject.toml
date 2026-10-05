@@ -1,0 +1,38 @@
+[project]
+name = "cripto-marketdata"
+version = "0.0.0"
+description = "Self-hosted crypto marketdata stack: Parquet lake + TimescaleDB for perpetual futures"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    # DB
+    "psycopg[binary,pool]==3.3.6",
+    # Columnar / lake
+    "pyarrow==25.0.1",
+    "polars==1.44.2",
+    "duckdb==1.5.6",
+    # Exchanges
+    "ccxt==4.5.85",
+    "cryptofeed==3.0.1",
+    # Bot
+    "aiogram==3.31.0",
+    "pydantic==2.13.5",
+    # Backtesting
+    "vectorbt==1.1.1",
+    "numba==0.68.0",
+    "numpy==2.5.3",
+    "pandas==3.0.6",
+    "scipy==1.18.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.3.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

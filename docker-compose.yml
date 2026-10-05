@@ -1,0 +1,145 @@
+name: cripto-marketdata
+
+# Imagen base compartida: todo servicio Python del stack sale de aqui.
+x-stack-base: &stack-base
+  build:
+    context: .
+    dockerfile: docker/stack-base.Dockerfile
+  image: cripto-marketdata/stack-base:0.0.0
+  # Todo servicio Python escribe en lake/, que es un bind mount del host. Sin esto el
+  # contenedor crea los ficheros como root y luego el usuario no puede borrarlos ni editarlos
+  # sin `sudo` (pasa en el bulk y en los reports de _qa/).
+  #
+  # Se usan LAKE_UID/LAKE_GID y no UID/GID a proposito: bash define UID como variable de shell
+  # pero NO la exporta, asi que compose recibiria una cadena vacia y `user: ":"` es invalido.
+  # LAKE_UID/LAKE_GID estan en .env, que compose si carga.
+  user: "${LAKE_UID:-1000}:${LAKE_GID:-1000}"
+  env_file:
+    - .env
+  environment: &app-env
+    TZ: UTC
+    LAKE_DIR: /data/lake
+    HOME: /tmp
+    ENABLE_COMPRESSION: "${ENABLE_COMPRESSION:-false}"
+    MIGRATE_DSN: "postgresql://${POSTGRES_USER:-marketdata}:${POSTGRES_PASSWORD}@tsdb:5432/${POSTGRES_DB:-marketdata}"
+  volumes:
+    - ./lake:/data/lake
+  depends_on:
+    tsdb:
+      condition: service_healthy
+
+x-batch: &batch
+  <<: *stack-base
+  profiles: ["batch"]
+  restart: "no"
+
+x-daemon: &daemon
+  <<: *stack-base
+  restart: unless-stopped
+
+services:
+  # ---------------------------------------------------------------- base de datos
+  tsdb:
+    image: timescale/timescaledb:2.30.2-pg16
+    container_name: cmd_tsdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-marketdata}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-marketdata}"
+      POSTGRES_DB: "${POSTGRES_DB:-marketdata}"
+      TIMESCALEDB_TELEMETRY: "off"
+      TZ: UTC
+    # Sin docker-entrypoint-initdb.d (regla 8): el schema lo crea tsdb/migrate.py,
+    # que ademas es idempotente y se puede re-ejecutar. initdb solo corre con volumen vacio.
+    command: ["postgres", "-c", "timezone=UTC"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Puerto publicado solo en loopback: no expuesto a la red.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-marketdata} -d ${POSTGRES_DB:-marketdata}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  # ---------------------------------------------------------------- batch (Fase 0 stubs)
+  migrate:
+    <<: *batch
+    command: ["python", "tsdb/migrate.py"]
+
+  # Backfill historico de Binance Vision a Parquet. Es idempotente: lo que ya esta en
+  # lake/manifest.jsonl como done se salta, asi que se puede relanzar sin miedo.
+  bulk:
+    <<: *batch
+    command:
+      - "python"
+      - "-m"
+      - "bulk"
+      - "download"
+      - "--dtype"
+      - "${BULK_DTYPE:-klines}"
+      - "--symbol"
+      - "${BULK_SYMBOL:-BTCUSDT}"
+      - "--tf"
+      - "${BULK_TF:-1m}"
+      - "--workers"
+      - "${BULK_WORKERS:-12}"
+
+  # Carga lake -> Timescale. `catchup` (todo el historico, idempotente) o `backfill` (un dia).
+  loader:
+    <<: *batch
+    command: ["python", "-m", "loader", "${LOADER_CMD:-backfill}"]
+
+  # Backfill diario a las 00:05 UTC. A las 00:00 el dia anterior todavia se esta served en
+  # data.binance.vision y se cargaria un dia incompleto; a las 00:05 esta cerrado.
+  # catchup: daily / true  -> relanza el dia anterior cada noche.
+  # catchup: daily / false -> apagado (util mientras se carga el historico a mano).
+  backfill-daily:
+    <<: *batch
+    command: ["python", "ops/daily.sh"]
+    depends_on:
+      tsdb:
+        condition: service_healthy
+    labels:
+      run: "00 5 * * *"
+
+  # ---------------------------------------------------------------- daemons (Fase 0 stubs)
+  feed-daemon:
+    <<: *daemon
+    command: ["python", "-m", "feed.daemon"]
+    environment:
+      <<: *app-env
+      # 5 exchanges x 2 simbolos. Ampliar.symbolos se cambia aqui (docs/acceptance-fase2.md).
+      FEED_EXCHANGES: "${FEED_EXCHANGES:-binance_futures,bybit,okx,bitget,hyperliquid}"
+      FEED_SYMBOLS: "${FEED_SYMBOLS:-BTC,ETH}"
+      FEED_FLUSH_INTERVAL: "${FEED_FLUSH_INTERVAL:-1.0}"
+      FEED_BUFFER_SIZE: "${FEED_BUFFER_SIZE:-1000}"
+      FEED_SHUTDOWN_GRACE: "${FEED_SHUTDOWN_GRACE:-20}"
+
+  # Reparador de huecos. Lee `ingest_gaps`, los repara con REST/volcados y los cierra.
+  # Apagado por defecto (`docker-compose --profile repair up -d repair`): mientras no haya
+  # deteccion en el daemon no hay nada que reparar, y un worker ocioso solo gastaria peticiones
+  # del cubo de tokens.
+  repair:
+    <<: *daemon
+    command:
+      - "python"
+      - "-m"
+      - "repair.worker"
+      - "${REPAIR_CMD:-run}"
+      - "--intervalo"
+      - "${REPAIR_INTERVALO:-30}"
+    profiles: ["repair"]
+
+  bot:
+    <<: *daemon
+    command: ["python", "ops/stub.py", "bot", "--interval", "60"]
+
+  validator:
+    <<: *daemon
+    command: ["python", "ops/stub.py", "validator", "--interval", "300"]
+
+volumes:
+  pgdata:
