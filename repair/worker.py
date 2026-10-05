@@ -69,7 +69,17 @@ class Worker:
         import psycopg
 
         self.ledger.open()
-        self.conn = psycopg.connect(self.dsn, autocommit=False)
+        # `autocommit=True` y NO `False`, y no es cosmetico. Con `autocommit=False`, el
+        # `SET TIME ZONE` de abajo abre una transaccion implicita de psycopg3: los
+        # `with conn.transaction()` de `repair/ingest.py` se convierten en SAVEPOINTs dentro de
+        # ella, y todo se revierte al hacer `close()`. El ledger, que va en su propia conexion
+        # autocommit, si habia confirmado el estado `repaired`: el hueco quedaba cerrado y sin
+        # una sola fila. Medido en el hueco 704 (binance_um/BTCUSDT, ~23,8 h,
+        # `rows_repaired=47994` frente a 0 filas en `trades` con `source='rest'`).
+        #
+        # Con autocommit, `SET TIME ZONE` se aplica a la sesion y cada `conn.transaction()` es una
+        # transaccion real y autonoma: o entra el lote entero, o no entra nada.
+        self.conn = psycopg.connect(self.dsn, autocommit=True)
         self.conn.execute("SET TIME ZONE 'UTC'")
 
     def close(self) -> None:
@@ -107,13 +117,25 @@ class Worker:
         try:
             resultado = (adapter.fetch_candles(gap) if gap.dtype == "candles"
                          else adapter.fetch_trades(gap))
-        except Banned as exc:
-            # No cuenta como intento fallido: se espera y se reintentara.
-            self.ledger.release(gap.id)
-            log(component="repair", event="ban_backoff", exchange=gap.exchange,
-                symbol=gap.symbol, dtype=gap.dtype, seconds=round(exc.retry_after, 1))
+        except (Banned, RateLimited) as exc:
+            # Ni un 418 ni un 429 son culpa del hueco: los dos son de la IP, y la IP es del
+            # usuario, compartida con el backfill, el loader y el reconciliador. Se espera y se
+            # reintenta, sin gastar uno de los 5 intentos.
+            #
+            # Antes el 429 caia en el `except` de abajo y cerraba el hueco como `partial`
+            # consumiendo intento. Medido en el 704: un unico -1003 de Binance lo dejo en
+            # `partial` con `attempts=1` y 0 filas, cuando el rango era perfectamente reparable y
+            # solo habia que esperar 4 s. A los 5 huecos asi un exchange entero queda
+            # "irrecuperable" sin que nadie haya intentado nada.
+            #
+            # `bump_attempt` ya habia corrido: se deshace con el `release`, que lo devuelve a
+            # `open` y decrementa `attempts` para que el hueco no gaste de los 5.
+            self.ledger.release(gap.id, deshacer_intento=True)
+            log(component="repair", event="rate_limit_backoff", exchange=gap.exchange,
+                symbol=gap.symbol, dtype=gap.dtype, kind=type(exc).__name__,
+                seconds=round(exc.retry_after, 1))
             return "fallidos"
-        except (RateLimited, HttpError) as exc:
+        except HttpError as exc:
             self.ledger.finish(gap.id, "partial", note=f"intento {gap.attempts + 1}: {exc}"[:400])
             log(component="repair", event="error", exchange=gap.exchange, symbol=gap.symbol,
                 dtype=gap.dtype, gap_from=gap.gap_from_ms, gap_to=gap.gap_to_ms,

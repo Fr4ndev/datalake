@@ -56,12 +56,27 @@ EXCHANGE_CLASSES = {
 def _ms(timestamp: float | None) -> int:
     """Timestamp de cryptofeed (float en SEGUNDOS) -> ms enteros UTC. Regla 16.
 
-    Se redondea, no se trunca: un float de segundos con 6 decimales puede quedarse 1 ms por debajo
-    del entero real, y truncar asignaria el trade al segundo anterior.
+    Se trunca, no se redondea. cryptofeed normaliza dividiendo entre 1000
+    (`Binance.timestamp_normalize: return ts / 1000.0`), y truncar es la operacion inversa
+    exacta: `floor((T/1000)*1000) == T` para cualquier `T` entero de ms. Redondear tambien
+    funciona con `T` entero, pero depende de que el error del float no empuje el valor a `.5`,
+    y medido no depende: con Binance, 87665/87665 filas coinciden con `transact_time` de
+    data.binance.vision, con delta 0.000 ms.
+
+    Donde el redondeo si falla es al LEER un volcado con mas precision que el milisegundo. Bybit
+    publica segundos con 4 decimales (100 us). Medido sobre el dia 2026-10-04, 91747 trades
+    presentes en WS y en el volcado:
+
+        WS == floor(volcado * 1000) : 91747/91747  (100.00%)
+        WS == round(volcado * 1000) : 49412/91747  ( 53.86%)
+
+    Es decir, con `round` el 46.14% de las filas queda 1 ms por encima del valor que trae el WS, y
+    la PK`(symbol, exchange, ts, trade_id)` ya no las reconoce como el mismo trade. Una sola regla
+    en todo el pipeline, la que deshace la normalizacion de cryptofeed.
     """
     if timestamp is None:
         return int(time.time() * 1000)
-    return int(round(float(timestamp) * 1000))
+    return int(float(timestamp) * 1000)
 
 
 class Daemon:
@@ -170,7 +185,7 @@ class Daemon:
         from .gaps import restart_gaps
 
         try:
-            self.ledger = GapLedger(conninfo())
+            self.ledger = GapLedger(conninfo(), symbols=self.cfg.symbols)
             self.ledger.open()
         except Exception as exc:  # noqa: BLE001
             self.ledger = None
@@ -198,6 +213,37 @@ class Daemon:
         interrogar a cryptofeed en tiempo de ejecucion.
         """
         return self.feeds_vigilados
+
+    def _sembrar_id_jump(self) -> None:
+        """Carga en el detector de salto de id el ultimo trade ya guardado por clave.
+
+        El reinicio es, en si mismo, una fuente de huecos: si el proceso estuvo parado un rato,
+        al volver el `id` siguiente salta y ese tramo no existe en la tabla. Sin sembrar, el primer
+        mensaje tras arrancar no tiene antecedente contra el que compararse y el hueco se pierde
+        sin dejar rastro en `ingest_gaps`. Es el caso mas caro de perder deteccion: el ledger
+        parece sano porque no tiene nada, y no tiene nada porque nadie lo miraba.
+        """
+        if self.ledger is None:
+            return
+        try:
+            # `cfg.symbols` son los nombres cortos de cryptofeed (`BTC`), y en la tabla el simbolo
+            # es el perpetuo normalizado (`BTCUSDT`). Se usa la misma funcion que el writer para no
+            # tener dos reglas de nombres: preguntando por `BTC` no sale ninguna fila y la siembra se
+            # queda vacia sin decir nada, que es el fallo que se quiere evitar.
+            from .writer import Store
+            simbolos = [Store._sym(e, sym) for e in self.cfg.exchanges for sym in self.cfg.symbols]
+            filas = self.ledger.ultimo_trade_por_clave(self.cfg.exchanges,
+                                                       simbolos=sorted(set(simbolos)))
+        except Exception as exc:  # noqa: BLE001
+            log(component="feed", event="id_jump_seed_error", error=str(exc)[:140])
+            return
+        sembradas = 0
+        for exchange, symbol, trade_id, ts_ms in filas:
+            if self.id_jump.sembrar(exchange, symbol, trade_id, ts_ms):
+                sembradas += 1
+        if sembradas:
+            log(component="feed", event="id_jump_seeded", claves=sembradas,
+                detalle=",".join(f"{f[0]}/{f[1]}@{f[2]}" for f in filas[:6]))
 
     def _sincronizar_abiertos(self) -> None:
         """Quita del watchdog las claves cuyo hueco ya no esta vivo en el ledger.
@@ -381,6 +427,7 @@ class Daemon:
         self.feedhandler = fh
         # Despues de `build()`: `_claves_vigiladas` lee los feeds ya construidos.
         self._abrir_ledger()
+        self._sembrar_id_jump()
 
         loop = asyncio.get_running_loop()
         flusher = loop.create_task(self._flush_loop())

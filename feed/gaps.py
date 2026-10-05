@@ -39,6 +39,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable
 
+from bulk.logfmt import log
 from common.exchanges import canonico
 
 #: (exchange, symbol, dtype)
@@ -193,6 +194,27 @@ class IdJumpDetector:
         #: (exchange, symbol) -> (ultimo_id, ultimo_ts_ms)
         self.state: dict[tuple[str, str], tuple[int, int]] = {}
 
+    def sembrar(self, exchange: str, symbol: str, trade_id: str, event_ms: int) -> bool:
+        """Fija el estado inicial desde lo que ya esta en la tabla. Devuelve si lo acepto.
+
+        Sin esto, el primer mensaje tras un reinicio no tiene con que compararse, `observe`
+        devuelve `None` y el hueco que el propio reinicio acaba de abrir se queda sin registrar.
+        Medido: el 2026-10-04 el WS de Binance callo de las 09:55 a las 23:59 (14 h sin una sola
+        fila) y `ingest_gaps` no registro ni un hueco de `trades` para ese dia. El salto de id era
+        enorme y detectable: solo faltaba el punto de partida.
+        """
+        try:
+            exchange = canonico(exchange)
+        except ValueError:
+            return False
+        if exchange not in self.exchanges:
+            return False
+        try:
+            self.state[(exchange, symbol)] = (int(trade_id), int(event_ms))
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def observe(self, exchange: str, symbol: str, trade_id: str, event_ms: int) -> Gap | None:
         try:
             exchange = canonico(exchange)
@@ -333,8 +355,12 @@ def canonicaliza(gap: Gap) -> Gap:
     esto, un mismo exchange vive bajo dos claves en `open_keys` y el reparador claim()a uno de
     los dos mientras el otro se queda `open` para siempre.
     """
+    # El `note` se conserva: es la explicacion de POR QUE se detecto este hueco, y para un
+    # `id_jump` es lo unico que dice cuantos trades faltan y entre que ids. Sin el, el ledger
+    # guarda que hubo un corte y no por que, que es justo lo que hace falta para auditarlo.
     return Gap(exchange=canonico(gap.exchange), symbol=gap.symbol, dtype=gap.dtype,
-               gap_from_ms=gap.gap_from_ms, gap_to_ms=gap.gap_to_ms, reason=gap.reason)
+               gap_from_ms=gap.gap_from_ms, gap_to_ms=gap.gap_to_ms, reason=gap.reason,
+               note=gap.note)
 
 
 def pad(gap: Gap, pad_ms: int = PAD_MS) -> Gap:
@@ -365,9 +391,12 @@ class GapLedger:
     #: decision y no un olvido.
     VIVOS = ("open", "repairing", "partial")
 
-    def __init__(self, dsn: str, pad_ms: int = PAD_MS):
+    def __init__(self, dsn: str, pad_ms: int = PAD_MS, symbols: Iterable[str] | None = None):
         self.dsn = dsn
         self.pad_ms = pad_ms
+        #: Simbolos que vigila este proceso. `ultimo_trade_por_clave` los restringe para no leer
+        #: la tabla entera de `trades` al arrancar el daemon.
+        self.symbols = list(symbols) if symbols else []
         self._conn = None
 
     def open(self) -> None:
@@ -451,6 +480,34 @@ class GapLedger:
                 "SELECT DISTINCT exchange, symbol, dtype FROM ingest_gaps "
                 "WHERE status = ANY(%s)", (list(self.VIVOS),)).fetchall()
         }
+
+    def ultimo_trade_por_clave(self, exchanges: Iterable[str],
+                               simbolos: Iterable[str] | None = None) -> list[tuple[str, str, str, int]]:
+        """`(exchange, symbol, trade_id, ts_ms)` del ultimo trade guardado de cada clave.
+
+        Lo usa el daemon para sembrar el detector de salto de id al arrancar. Se consulta
+        `trades` en vez de `ingest_gaps` a proposito: el ledger solo sabe de los huecos que
+        registro, y justo al arrancar no ha registrado ninguno. La verdad de "donde lo deje la
+        ultima vez" esta en la tabla de datos.
+
+        Solo para exchanges con id numerico secuencial (Binance): en los demas el `trade_id` es un
+        uuid y la consulta no devolveria nada util, asi que se filtran en Python.
+        """
+        exchanges = [canonico(e) for e in exchanges]
+        simbolos = list(simbolos) if simbolos is not None else list(self.symbols)
+        if not exchanges or not simbolos:
+            return []
+        conn = self._require()
+        filas = conn.execute(
+            "SELECT DISTINCT ON (exchange, symbol) exchange, symbol, trade_id, ts "
+            "FROM trades WHERE exchange = ANY(%s) AND symbol = ANY(%s) "
+            "ORDER BY exchange, symbol, ts DESC", (exchanges, simbolos)).fetchall()
+        out = []
+        for exchange, symbol, trade_id, ts in filas:
+            if not str(trade_id).lstrip("-").isdigit():
+                continue
+            out.append((exchange, symbol, str(trade_id), int(ts.timestamp() * 1000)))
+        return out
 
     # ------------------------------------------------------------------ escritura
     def record(self, gaps: Iterable[Gap]) -> list[Gap]:
@@ -543,27 +600,84 @@ class GapLedger:
             "RETURNING attempts", (gap_id,))
         return cur.fetchone()[0]
 
-    def release(self, gap_id: int) -> None:
-        """Devuelve a `open` un hueco que se dejo en `repairing` (worker caido)."""
+    def release(self, gap_id: int, deshacer_intento: bool = False) -> None:
+        """Devuelve a `open` un hueco que se dejo en `repairing` (worker caido).
+
+        `deshacer_intento=True` ademas descuenta el `attempts` que el worker ya habia subido con
+        `bump_attempt`. Es para los fallos que NO son culpa del hueco (418 y 429: la IP esta
+        baneada o saturada). En ese caso el hueco se reintentara tal cual, y sin gastar uno de los
+        5 intentos que acabarian declarandolo irrecuperable.
+        """
         conn = self._require()
+        if deshacer_intento:
+            conn.execute(
+                "UPDATE ingest_gaps SET status='open', attempts=GREATEST(attempts - 1, 0) "
+                "WHERE id=%s AND status='repairing'", (gap_id,))
+            return
         conn.execute("UPDATE ingest_gaps SET status='open' WHERE id=%s AND status='repairing'", (gap_id,))
 
     # ------------------------------------------------------------------ worker
-    def claim(self, limit: int = 4, max_attempts: int = 5) -> list[Gap]:
+    def recuperar_zarandados(self, max_antiguedad_s: float = 900.0) -> int:
+        """Devuelve a `open` los `repairing` cuyo worker murio sin cerrar el hueco.
+
+        `claim()` marca `repairing` y `finish()`/`release()` lo resuelven, asi que un worker al que
+        matan entre medias (un `docker kill`, un OOM, un redeploy) deja el hueco **para siempre** en
+        `repairing`: `claim` solo mira `status='open'`, asi que nadie vuelve a intentarlo y el hueco
+        se queda sin reparar sin decir nada. Es la regla 15 justo en el punto donde no hay watchdog
+        que lo note.
+
+        Solo toca los que llevan mas de `max_antiguedad_s` en `repairing`: un worker sano puede
+        tardar mas de 15 min con un hueco grande, y reclaimarselo seria tener dos workers
+        escribiendo las mismas filas a la vez. La confianza en ese caso la da `SKIP LOCKED` del
+        propio `claim`, no un reloj.
+
+        Devuelve cuantos ha rescatado, para que quede en el log.
+        """
+        conn = self._require()
+        cur = conn.execute(
+            "UPDATE ingest_gaps SET status='open' WHERE status='repairing' "
+            "  AND updated_at < now() - make_interval(secs => %s) RETURNING id",
+            (float(max_antiguedad_s),))
+        ids = [r[0] for r in cur.fetchall()]
+        if ids:
+            log(component="gaps", event="repairing_recovered", count=len(ids),
+                ids=",".join(str(i) for i in ids[:20]), max_age_s=max_antiguedad_s)
+        return len(ids)
+
+    def claim(self, limit: int = 4, max_attempts: int = 5,
+              exchanges: Iterable[str] | None = None) -> list[Gap]:
         """Toma huecos abiertos para reparar, sin que dos workers possan el mismo.
 
         `FOR UPDATE SKIP LOCKED`: el worker de `repair/` puede correr en paralelo con el
         reconciliador diario sin que se pisen.
+
+        `exchanges` acota el reclamo a ciertos exchanges. Sin ese filtro, un `claim()` de los
+        tests se lleva un hueco REAL del daemon que este corriendo a la vez: lo marca `repairing`,
+        el test falla porque no era el suyo, y de paso el hueco de produccion queda eighteen horas
+        esperando a que alguien lo reintente. Los tests filtran por sus exchanges de prueba.
+
+        Antes de reclamar llama a `recuperar_zarandados()`: sin eso, un worker muerto deja sus
+        huecos en `repairing` para siempre y este `WHERE status='open'` no los volveria a ver.
         """
+        self.recuperar_zarandados()
         conn = self._require()
         out: list[Gap] = []
         with conn.transaction():
-            rows = conn.execute(
-                "SELECT id, exchange, symbol, dtype, EXTRACT(EPOCH FROM gap_from)*1000, "
-                "EXTRACT(EPOCH FROM gap_to)*1000, reason, attempts, note FROM ingest_gaps "
-                "WHERE status='open' AND attempts < %s "
-                "ORDER BY gap_from LIMIT %s FOR UPDATE SKIP LOCKED",
-                (max_attempts, limit)).fetchall()
+            if exchanges is None:
+                rows = conn.execute(
+                    "SELECT id, exchange, symbol, dtype, EXTRACT(EPOCH FROM gap_from)*1000, "
+                    "EXTRACT(EPOCH FROM gap_to)*1000, reason, attempts, note FROM ingest_gaps "
+                    "WHERE status='open' AND attempts < %s "
+                    "ORDER BY gap_from LIMIT %s FOR UPDATE SKIP LOCKED",
+                    (max_attempts, limit)).fetchall()
+            else:
+                filas = [canonico(e) for e in exchanges]
+                rows = conn.execute(
+                    "SELECT id, exchange, symbol, dtype, EXTRACT(EPOCH FROM gap_from)*1000, "
+                    "EXTRACT(EPOCH FROM gap_to)*1000, reason, attempts, note FROM ingest_gaps "
+                    "WHERE status='open' AND attempts < %s AND exchange = ANY(%s) "
+                    "ORDER BY gap_from LIMIT %s FOR UPDATE SKIP LOCKED",
+                    (max_attempts, filas, limit)).fetchall()
             for r in rows:
                 conn.execute("UPDATE ingest_gaps SET status='repairing' WHERE id=%s", (r[0],))
                 out.append(Gap(exchange=r[1], symbol=r[2], dtype=r[3], gap_from_ms=int(r[4]),

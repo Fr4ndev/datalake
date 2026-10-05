@@ -160,8 +160,84 @@ def test_binance_ventana_de_30min_para_no_comerse_el_4166():
         gap(ahora - 2 * HORA, ahora - HORA + 1000))
     assert len(http.llamadas) >= 2
     for c in http.llamadas:
-        span = c["params"]["endTime"] - c["params"]["startTime"]
-        assert span <= 30 * 60_000 + 1000, span
+        if "startTime" in c["params"]:  # las de `fromId` no llevan ventana
+            span = c["params"]["endTime"] - c["params"]["startTime"]
+            assert span <= 30 * 60_000 + 1000, span
+
+
+class _BinancePaginando:
+    """Emula el `/aggTrades` de verdad: `limit` filas por pagina y `fromId` excluyente con
+    `startTime`/`endTime`. Devuelve `n` trades repartidos por el hueco, uno por ms."""
+
+    def __init__(self, desde_ms, hasta_ms, n):
+        self.desde, self.hasta, self.n = desde_ms, hasta_ms, n
+        self.llamadas: list[dict] = []
+
+    def get(self, exchange, url, params=None, **kw):
+        p = dict(params or {})
+        self.llamadas.append(p)
+        # El trade_id ES el timestamp en este fake, asi que `fromId` es un indice absoluto.
+        i = (p["fromId"] if "fromId" in p else max(p["startTime"], self.desde)) - self.desde
+        fin = min(i + 1000, self.n)
+        if fin <= i:
+            return []
+        return [{"a": self.desde + j, "p": "1", "q": "1", "T": self.desde + j, "m": False}
+                for j in range(i, fin)]
+
+    @property
+    def paginas(self):
+        return len(self.llamadas)
+
+
+def test_binance_pagina_hasta_agotar_la_ventana():
+    """Una pagina LLENA no significa ventana agotada.
+
+    Este es el fallo que produjo el gap 704 cerrado como `repaired` sin una sola fila: 4.500 trades
+    en 20 min, el endpoint devuelve 1.000 y el adaptador tomaba esa respuesta como el final de la
+    ventana, declaraba `covered_through` completo y el worker cerraba el hueco.
+    """
+    from repair.adapters.binance import LIMITE_PAGINA
+
+    ahora = 1_700_000_000_000
+    desde = ahora - 20 * 60_000
+    http = _BinancePaginando(desde, ahora, 4500)
+    res = BinanceFuturesAdapter(http, now_ms=ahora).fetch_trades(gap(desde, ahora))
+    assert len(res.rows) == 4500, len(res.rows)
+    assert http.paginas == 5, http.paginas  # 4 paginas llenas + la quinta corta
+    assert any("fromId" in p for p in http.llamadas), "hubo que seguir paginando por fromId"
+    assert res.limitation is None, res.limitation
+    assert res.covered_through_ms >= ahora
+
+
+def test_binance_no_declara_cobertura_si_no_pudo_agotar_la_ventana():
+    """Si se corta por el tope de paginas, el hueco NO se cierra: se declara `limitation` y
+    `covered_through=None`, y el worker lo deja en `partial`."""
+    import repair.adapters.binance as mod
+
+    ahora = 1_700_000_000_000
+    desde = ahora - 20 * 60_000
+    http = _BinancePaginando(desde, ahora, 9000)
+    viejo = mod.MAX_PAGINAS
+    mod.MAX_PAGINAS = 2  # solo 2 paginas: insuficiente para 9.000
+    try:
+        res = BinanceFuturesAdapter(http, now_ms=ahora).fetch_trades(gap(desde, ahora))
+    finally:
+        mod.MAX_PAGINAS = viejo
+    assert len(res.rows) == 2000, len(res.rows)
+    assert res.limitation is not None, "sin esto el hueco se cerraria como repaired incompleto"
+    assert res.covered_through_ms is None
+    assert "no sabe" in res.limitation or "seguia llena" in res.limitation
+
+
+def test_binance_no_arrastra_trades_del_resto_por_el_fromId():
+    """`fromId` ignora `endTime`: la ventana se da por agotada en cuanto la ultima fila la pasa,
+    y lo que venga despues pertenece a la ventana siguiente."""
+    ahora = 1_700_000_000_000
+    desde = ahora - 20 * 60_000
+    http = _BinancePaginando(desde, ahora + 10 * HORA, 9000)
+    res = BinanceFuturesAdapter(http, now_ms=ahora).fetch_trades(gap(desde, ahora))
+    assert all(desde <= r.ts_ms <= ahora for r in res.rows), "se colaron trades fuera del hueco"
+    assert res.limitation is None
 
 
 # ============================================================ Bybit
@@ -203,15 +279,21 @@ def test_bybit_ventana_antijoin_acotada():
 class LedgerFalso:
     def __init__(self):
         self.fin: list[tuple] = []
+        self.bumps: list[int] = []
+        #: veces que se pidio `release(..., deshacer_intento=True)`.
+        self.intentos_deshechos = 0
 
     def finish(self, gap_id, status, source=None, rows=0, note=None):
         self.fin.append((gap_id, status, rows, note))
 
     def bump_attempt(self, gap_id):
+        self.bumps.append(gap_id)
         return 1
 
-    def release(self, gap_id):
+    def release(self, gap_id, deshacer_intento=False):
         self.fin.append((gap_id, "release", 0, None))
+        if deshacer_intento:
+            self.intentos_deshechos += 1
 
 
 def _worker_con(resultado) -> Worker:
@@ -326,6 +408,40 @@ def test_insert_trades_por_id_no_duplica_ni_sigue_la_pk():
 
 
 @needs_db
+def test_la_conexion_del_worker_conserva_lo_insertado_al_cerrar():
+    """Regresion del fallo que cerro el gap 704 como `repaired` con 0 filas en la tabla.
+
+    Con `autocommit=False`, el `SET TIME ZONE` del worker abria una transaccion implicita: los
+    `with conn.transaction()` de `repair/ingest.py` eran SAVEPOINTs y todo se revertia en
+    `close()`, mientras el ledger (conexion propia, autocommit) ya habia confirmado el estado.
+
+    Este test usa `Worker.open()` de verdad, no una conexion hecha a mano: si alguien vuelve a
+    poner `autocommit=False` aqui, el test falla.
+    """
+    import psycopg
+
+    from repair.ingest import insert_trades
+
+    exchange = "binance_um"
+    fila = TradeRow("worker-persist-1", 1_795_000_000_000, "buy", 100.0, 0.5, "BTCUSDT")
+    w = Worker(DSN, exchanges=["binance_um"])
+    w.open()
+    try:
+        with psycopg.connect(DSN, autocommit=True) as limpio:
+            limpio.execute("SET TIME ZONE 'UTC'")
+            limpio.execute("DELETE FROM trades WHERE trade_id='worker-persist-1'")
+        assert insert_trades(w.conn, exchange, [fila], "rest") == 1
+    finally:
+        w.close()  # aqui es donde se perdia todo
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute("SET TIME ZONE 'UTC'")
+        total = conn.execute("SELECT count(*) FROM trades WHERE trade_id='worker-persist-1'"
+                             ).fetchone()[0]
+        conn.execute("DELETE FROM trades WHERE trade_id='worker-persist-1'")
+    assert total == 1, "el lote se perdio al cerrar: autocommit=False en el worker"
+
+
+@needs_db
 def test_fusion_de_gaps_no_borra_filas():
     """Regla: no borrar, cerrar con status. La deteccion original se conserva con 'merged'."""
     from feed.gaps import GapLedger
@@ -343,17 +459,24 @@ def test_fusion_de_gaps_no_borra_filas():
         lg.record([gap(base, base + 10_000)])
         lg.record([gap(base + 20_000, base + 30_000)])
         lg.record([gap(base + 5_000, base + 25_000)])
-        filas = lg.list_gaps(limit=50)
-        vivas = [f for f in filas if f.exchange == "binance_um" and f.symbol == "BTCUSDT"
-                 and f.dtype == "trades" and base <= f.gap_from_ms <= base + 100_000]
-        canonicas = [f for f in vivas if f.status in ("open", "repairing")]
-        fundidas = [f for f in vivas if f.status == "merged"]
-        assert len(canonicas) == 1, "debe quedar una sola fila viva"
-        assert canonicas[0].gap_from_ms == base
-        assert canonicas[0].gap_to_ms == base + 30_000, "la fusion debe cubrir los dos rangos"
+        # No se usa `list_gaps()`: devuelve las N primeras por `id` y el ledger real ya tiene mas de
+        # 50 filas, asi que los huecos de este test se caian fuera del corte y el test pasaba/fallaba
+        # segun cuantos huecos tuviera el daemon. La ventana se consulta por SQL, que es lo que el
+        # test afirma medir.
+        filas = lg._require().execute(
+            "SELECT id, status, EXTRACT(EPOCH FROM gap_from)*1000, EXTRACT(EPOCH FROM gap_to)*1000 "
+            "FROM ingest_gaps WHERE exchange='binance_um' AND symbol='BTCUSDT' AND dtype='trades' "
+            "  AND EXTRACT(EPOCH FROM gap_from)*1000 BETWEEN %s AND %s ORDER BY id",
+            (base - 100_000, base + 200_000)).fetchall()
+        vivas = [(int(f[0]), f[1], int(f[2]), int(f[3])) for f in filas]
+        canonicas = [f for f in vivas if f[1] in ("open", "repairing")]
+        fundidas = [f for f in vivas if f[1] == "merged"]
+        assert len(canonicas) == 1, vivas
+        assert canonicas[0][2] == base, canonicas[0]
+        assert canonicas[0][3] == base + 30_000, "la fusion debe cubrir los dos rangos"
         assert fundidas, "la fila absorbida debe conservarse como 'merged', no borrarse"
         for f in fundidas:
-            assert f.id != canonicas[0].id
+            assert f[0] != canonicas[0][0]
         conn = lg._require()
         conn.execute("DELETE FROM ingest_gaps WHERE symbol='BTCUSDT' "
                      "AND EXTRACT(EPOCH FROM gap_from)*1000 BETWEEN %s AND %s",
@@ -541,6 +664,72 @@ def test_los_limites_de_http_se_buscan_por_exchange_canonico():
     assert c.weight("okx") == LIMITS["okx"][2]
     assert c.weight("bybit") == LIMITS["bybit"][2]
     assert c.weight("BINANCE_FUTURES") == LIMITS["binance_um"][2]
+
+
+def test_el_cubo_no_rhita_mas_lento_que_el_limite_del_exchange():
+    """`refill_per_s` va en TOKENS, no en peticiones, y por eso se confunde.
+
+    Binance estaba en `(20.0, 2.0, 20.0)`: 2 tokens/s con peticiones de peso 20 son **10 s por
+    peticion**, cuando su limite son 2400 de peso por minuto (2 peticiones/s). No rompia nada:
+    tardaba 5x mas de lo permitido. Medido en el hueco 704 (23,8 h de BTC, ~500 paginas): 50 min
+    sin cerrar nada, con `attempts=1` y cero filas insertadas.
+
+    El cubo puede ir MAS lento que el limite (es una decision, no un fallo), pero nunca mas rapido
+    de lo que el endpoint documenta.
+    """
+    from repair.http import LIMITS
+
+    #: exchange -> (peticiones/segundo segun la documentacion, margen minimo que hay que dejar).
+    #: El margen no es opcional: la IP es del usuario y la comparten el backfill, el loader y el
+    #: reconciliador. Medido: al 100 % del limite, Binance devolvio -1003 a las 212 peticiones.
+    documentado = {
+        "binance_um": (2400 / 60 / LIMITS["binance_um"][2], 0.7),  # peso/min / peso peticion
+        "okx": (20 / 2, 1.0),                                      # 20 peticiones / 2 s
+        "bitget": (10, 1.0),
+        "bybit": (600 / 5, 0.5),                                   # 600 / 5 s, aqui 20/s a proposito
+        "hyperliquid": (20, 1.0),
+    }
+    for exchange, (tope, margen) in documentado.items():
+        cap, refill, peso_pet = LIMITS[exchange]
+        sostenidas = refill / peso_pet
+        # Nunca mas rapido que el limite...
+        assert sostenidas <= tope + 1e-9, (exchange, sostenidas, "por encima del limite", tope)
+        # ...y con margen, porque la IP es compartida.
+        assert sostenidas <= tope * margen + 1e-9, (exchange, sostenidas, "sin margen para la IP")
+        # Y tiene que ser util: por debajo de 0,5 req/s un hueco de horas no se cierra nunca.
+        assert sostenidas >= 0.5, (exchange, sostenidas, "el cubo no deja avanzar la reparacion")
+
+
+def test_un_429_no_quema_intentos_del_hueco():
+    """Un 429 es tan poco culpa del hueco como un 418: es la IP.
+
+    Antes caia en el mismo `except` que los errores HTTP y cerraba el hueco como `partial`
+    consumiendo uno de los 5 intentos. Medido en el hueco 704: un unico 429 de Binance lo dejo
+    en `partial` con `attempts=1` y 0 filas, cuando el rango es perfectamente reparable y solo
+    habia que esperar 4 s.
+    """
+    from repair.http import RateLimited
+
+    class AdapterQueSeLimita:
+        exchange = "binance_um"
+
+        def can_repair(self, g):
+            return True, None
+
+        def fetch_trades(self, g):
+            raise RateLimited(4.0, "-1003 Too many requests")
+
+    w = Worker.__new__(Worker)
+    w.ledger = LedgerFalso()
+    w.conn = object()
+    w.adaptadores = {"binance_um": AdapterQueSeLimita()}
+    g = gap(1000, 2000)
+    g.attempts = 2
+    assert w.reparar(g) == "fallidos"
+    # `release` con `deshacer_intento`, no `finish`: el hueco vuelve a `open` sin gastar intento.
+    assert w.ledger.fin[-1][1] == "release", w.ledger.fin[-1]
+    assert len(w.ledger.bumps) == 1, "el bump ocurre una vez, antes de la llamada"
+    assert w.ledger.intentos_deshechos == 1, "un 429 no debe consumir uno de los 5 intentos"
 
 
 def test_un_solo_cubo_por_exchange_aunque_lleguen_dos_grafias():

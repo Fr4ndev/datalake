@@ -71,15 +71,19 @@ class BinanceFuturesAdapter(Adapter):
     def _por_rest(self, gap) -> RepairResult:
         filas: dict[str, TradeRow] = {}
         cubierta_hasta = gap.gap_from_ms
+        truncado_en: int | None = None
         # Se avanza en ventanas de 30 min porque `startTime`+`endTime` se rechaza si la ventana
-        # es demasiado ancha. Paginar con `fromId` tambien funciona, perove mejor con `endTime`
-        # fijo: se sabe exactamente donde parar.
+        # es demasiado ancha. Dentro de cada ventana, si la pagina viene LLENA hay que pedir la
+        # siguiente por `fromId`: el endpoint devuelve `limit` filas y ninguna pista de si quedan
+        # mas. Antes se daba por agotada y `covered_through` avanzaba igual, con lo que un hueco
+        # de 20 min con 12.000 trades se declaraba `repaired` con 1.000 filas insertadas.
         cursor = gap.gap_from_ms
         for _ in range(MAX_PAGINAS):
             fin = min(cursor + VENTANA_MS, gap.gap_to_ms + 1000)
-            pagina = self._agg_trades(gap.symbol, cursor, fin)
-            for fila in pagina:
-                filas[fila.trade_id] = fila
+            agotada, motivo = self._ventana(gap, cursor, fin, filas)
+            if not agotada:
+                truncado_en = cursor
+                break
             # `covered_through` es el FIN DE LA VENTANA CONSULTADA, no el ts del ultimo trade.
             # Una respuesta vacia (o cuya ultima fila es anterior) es precisamente la prueba de que
             # no habia trades ahi. Medirlo por el ultimo trade daba huecos "partial" con 929 filas
@@ -88,16 +92,54 @@ class BinanceFuturesAdapter(Adapter):
             if fin >= gap.gap_to_ms:
                 break
             cursor = fin + 1
+        limitacion = None
+        if truncado_en is not None:
+            limitacion = (f"el REST se quedo corto: tras {len(filas)} aggTrades la ventana que "
+                          f"empieza en {truncado_en} seguia llena de {LIMITE_PAGINA} filas "
+                          f"({motivo}), asi que no se sabe si faltan trades mas alla")
         return RepairResult(
-            rows=list(filas.values()), source="rest",
-            covered_from_ms=gap.gap_from_ms, covered_through_ms=cubierta_hasta,
+            rows=[r for r in filas.values() if gap.gap_from_ms <= r.ts_ms <= gap.gap_to_ms],
+            source="rest",
+            covered_from_ms=gap.gap_from_ms,
+            covered_through_ms=None if truncado_en is not None else cubierta_hasta,
             note=f"{len(filas)} aggTrades por REST en ventanas de 30 min",
+            limitation=limitacion,
         )
 
-    def _agg_trades(self, symbol: str, desde_ms: int, hasta_ms: int) -> list[TradeRow]:
-        datos = self.http.get(self.exchange, AGG_TRADES, {
-            "symbol": symbol, "startTime": int(desde_ms), "endTime": int(hasta_ms),
-            "limit": LIMITE_PAGINA})
+    def _ventana(self, gap, desde_ms: int, hasta_ms: int,
+                 filas: dict[str, TradeRow]) -> tuple[bool, str]:
+        """Recorre UNA ventana, paginando por `fromId`. Devuelve (agotada, motivo).
+
+        `fromId` y `startTime`/`endTime` son excluyentes en Binance: si se manda `fromId`, la
+        pagina empieza en ese trade id y `endTime` se ignora. Por eso al seguir un `fromId` hay
+        que filtrar por `ts` para no arrastrar trades de la ventana siguiente, y la ventana se
+        considera agotada cuando la pagina viene corta o cuando la ultima fila ya paso su `fin`.
+        """
+        siguiente_id: int | None = None
+        for _ in range(MAX_PAGINAS):
+            pagina = self._agg_trades(gap.symbol, desde_ms, hasta_ms, desde_id=siguiente_id)
+            if not pagina:
+                return True, "pagina vacia"
+            for fila in pagina:
+                if desde_ms <= fila.ts_ms <= hasta_ms:
+                    filas[fila.trade_id] = fila
+            ultima = pagina[-1]
+            if len(pagina) < LIMITE_PAGINA:
+                return True, "pagina corta"
+            if ultima.ts_ms > hasta_ms:
+                return True, "la ultima fila ya paso el fin de la ventana"
+            siguiente_id = int(ultima.trade_id) + 1
+        return False, f"agotadas {MAX_PAGINAS} paginas de {LIMITE_PAGINA} filas"
+
+    def _agg_trades(self, symbol: str, desde_ms: int, hasta_ms: int,
+                    desde_id: int | None = None) -> list[TradeRow]:
+        params: dict = {"symbol": symbol, "limit": LIMITE_PAGINA}
+        if desde_id is None:
+            params["startTime"] = int(desde_ms)
+            params["endTime"] = int(hasta_ms)
+        else:
+            params["fromId"] = int(desde_id)
+        datos = self.http.get(self.exchange, AGG_TRADES, params)
         salida: list[TradeRow] = []
         for x in datos if isinstance(datos, list) else []:
             salida.append(TradeRow(

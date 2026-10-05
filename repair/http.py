@@ -87,10 +87,30 @@ class Bucket:
 
 #: exchange canonico -> (capacidad del cubo, refill por segundo, peso de una peticion).
 #: Las claves son las de `common.exchanges.CANONICOS`: un cubo por exchange, con su nombre.
+#:
+#: El `refill_per_s` va en **tokens**, no en peticiones, y de ahi salio un bug de 20x: Binance
+#: estaba en `(20.0, 2.0, 20.0)`, o sea 2 tokens/s con peticiones de peso 20 = **10 s por
+#: peticion**, cuando su limite es 2400 de peso por minuto = 40 tokens/s = 2 peticiones/s. No
+#: reventaba nada: solo tardaba 5x mas de lo permitido, y en un hueco de 23,8 h de BTC (unas 500
+#: paginas de 1000 aggTrades) son 85 minutos en lugar de 17. Medido: el worker llevo 50 min
+#: sin haber cerrado el gap 704, con `attempts=1` y cero filas.
+#:
+#: Regla para no repetirlo: `refill_per_s = peso_max_por_minuto / 60`, y luego **por debajo**.
+#: El limite documentado es un techo, no un objetivo: la IP es del usuario y la comparten el
+#: backfill, el loader y el reconciliador. Ir pegado al tope produce 429 en cuanto cualquiera de
+#: los otros consume algo. Medido: con el refill al 100 % del limite (40 tokens/s = 2 peticiones/s)
+#: Binance devolvio `-1003 Too many requests; current limit of IP is 2400 requests per minute`
+#: a los 212 peticiones. Aqui va al 70 %.
 LIMITS: dict[str, tuple[float, float, float]] = {
-    "binance_um": (20.0, 2.0, 20.0),
+    # 2400 de peso/min, peso 20 por peticion = 2 peticiones/s. Al 70 %: 28 tokens/s = 1,4/s.
+    # La capacidad son 4 peticiones de golpe (80 tokens): racha corta y burst pequeno.
+    "binance_um": (80.0, 28.0, 20.0),
+    # OKX history-trades: 20 peticiones / 2 s -> 10/s.
     "okx": (40.0, 10.0, 1.0),
+    # Bitget: 10/s.
     "bitget": (20.0, 10.0, 1.0),
+    # Bybit: 600 / 5 s = 120/s. Aqui se va 20/s, por debajo del limite y a proposito: el
+    # reconciliador diario ya come de este cubo y no hace falta ir al tope.
     "bybit": (100.0, 20.0, 1.0),
     "hyperliquid": (60.0, 20.0, 1.0),
 }
