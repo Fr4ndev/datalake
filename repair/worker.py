@@ -58,11 +58,11 @@ class Worker:
     def _construir(self) -> dict:
         bybit = BybitAdapter(self.http)
         return {
-            "BINANCE_FUTURES": BinanceFuturesAdapter(self.http),
-            "OKX": OKXAdapter(self.http),
-            "BITGET": BitgetAdapter(self.http),
-            "BYBIT": bybit,
-            "HYPERLIQUID": HyperliquidAdapter(self.http),
+            "binance_um": BinanceFuturesAdapter(self.http),
+            "okx": OKXAdapter(self.http),
+            "bitget": BitgetAdapter(self.http),
+            "bybit": bybit,
+            "hyperliquid": HyperliquidAdapter(self.http),
         }
 
     def open(self) -> None:

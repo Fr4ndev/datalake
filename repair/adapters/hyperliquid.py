@@ -20,7 +20,7 @@ MAX_CANDLE_SNAPSHOT = 5000
 
 
 class HyperliquidAdapter(Adapter):
-    exchange = "HYPERLIQUID"
+    exchange = "hyperliquid"
     name = "hyperliquid"
 
     def __init__(self, client):

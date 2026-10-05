@@ -18,7 +18,7 @@ MAX_PAGINAS = 500
 
 
 class BitgetAdapter(Adapter):
-    exchange = "BITGET"
+    exchange = "bitget"
     name = "bitget"
 
     def __init__(self, client):

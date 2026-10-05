@@ -356,20 +356,20 @@ def test_coverage_devuelve_el_ultimo_ts_por_clave(limpio):
     """
     conn = limpio._require()
     ts_fijo = 1_700_000_123_000
-    conn.execute("DELETE FROM trades WHERE exchange='TESTEX' AND symbol='BTCUSDT'")
+    conn.execute("DELETE FROM trades WHERE exchange='TESTEX' AND symbol='TESTBTCUSDT'")
     conn.execute("INSERT INTO trades (symbol, exchange, trade_id, ts, side, price, amount, notional) "
-                 "VALUES ('BTCUSDT','TESTEX','cov-1', to_timestamp(%s/1000.0), 'buy', 1, 1, 1), "
-                 "       ('BTCUSDT','TESTEX','cov-2', to_timestamp(%s/1000.0), 'buy', 1, 1, 1) "
+                 "VALUES ('TESTBTCUSDT','TESTEX','cov-1', to_timestamp(%s/1000.0), 'buy', 1, 1, 1), "
+                 "       ('TESTBTCUSDT','TESTEX','cov-2', to_timestamp(%s/1000.0), 'buy', 1, 1, 1) "
                  "ON CONFLICT DO NOTHING", (ts_fijo - 60_000, ts_fijo))
     try:
-        cov = limpio.coverage([("TESTEX", "BTCUSDT", "trades")])
-        assert ("TESTEX", "BTCUSDT", "trades") in cov.last_ms
-        assert cov.last_ms[("TESTEX", "BTCUSDT", "trades")] == ts_fijo
+        cov = limpio.coverage([("TESTEX", "TESTBTCUSDT", "trades")])
+        assert ("TESTEX", "TESTBTCUSDT", "trades") in cov.last_ms
+        assert cov.last_ms[("TESTEX", "TESTBTCUSDT", "trades")] == ts_fijo
         # Referencia independiente: el propio Postgres, no el codigo del ledger.
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'UTC'")
             cur.execute("SELECT EXTRACT(EPOCH FROM max(ts))*1000 FROM trades "
-                        "WHERE exchange='TESTEX' AND symbol='BTCUSDT'")
+                        "WHERE exchange='TESTEX' AND symbol='TESTBTCUSDT'")
             assert abs(cur.fetchone()[0] - ts_fijo) < 1
     finally:
         conn.execute("DELETE FROM trades WHERE exchange='TESTEX'")

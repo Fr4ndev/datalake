@@ -16,6 +16,8 @@ se invocan como `await cb(obj, receipt_timestamp)` (cryptofeed/feed.py:478).
 
 from __future__ import annotations
 
+from common.exchanges import canonico
+
 import asyncio
 import time
 from datetime import datetime, timezone
@@ -357,11 +359,15 @@ class Daemon:
                 )
                 fh.add_feed(feed)
                 self.feeds.append(feed)
-                exch_id = classes[exchange].id
+                # Canonico desde aqui: el id de cryptofeed es `BINANCE_FUTURES` y la tabla ya
+                # guarda `binance_um`. Si la clave vigilada no coincide con lo que devuelve
+                # `open_keys()`, `_sincronizar_abiertos` creeria que todos los huecos estan
+                # cerrados y vaciaria `open_id` cada minuto -> el watchdog rearma sin parar.
+                exch_id = canonico(classes[exchange].id)
                 for sym in symbols:
-                    canonico = self.store._sym(exch_id, sym)
+                    simbolo = self.store._sym(classes[exchange].id, sym)
                     for ch in channels:
-                        self.feeds_vigilados.append((exch_id, canonico, str(ch)))
+                        self.feeds_vigilados.append((exch_id, simbolo, str(ch)))
                 log(component="feed", event="feed_added", exchange=exchange,
                     channels=",".join(channels), symbols=",".join(symbols),
                     claves=len(self.feeds_vigilados))

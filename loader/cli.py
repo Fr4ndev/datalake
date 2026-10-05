@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def common(sp):
         sp.add_argument("--symbol", default="BTCUSDT")
-        sp.add_argument("--exchange", default="binance")
+        sp.add_argument("--exchange", default="binance_um")
         sp.add_argument("--dtypes", nargs="+", default=list(LAKE_DTYPES), choices=sorted(TARGETS))
         sp.add_argument("--no-refresh", action="store_true", help="no refrescar caggs al terminar")
 

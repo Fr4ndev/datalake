@@ -39,6 +39,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable
 
+from common.exchanges import canonico
+
 #: (exchange, symbol, dtype)
 Key = tuple[str, str, str]
 
@@ -82,7 +84,7 @@ SILENCE_MS = {
 #:
 #: En Bybit/OKX/Bitget/Hyperliquid el id NO es una secuencia monotona comprobable (UUID, snowflake
 #: con timestamp incrustado, tid derivado), asi que un "salto" no significaria nada y no se activa.
-SEQUENTIAL_ID_EXCHANGES = {"BINANCE_FUTURES"}
+SEQUENTIAL_ID_EXCHANGES = {"binance_um"}
 
 
 @dataclass
@@ -183,12 +185,19 @@ class IdJumpDetector:
     """
 
     def __init__(self, exchanges: Iterable[str] = SEQUENTIAL_ID_EXCHANGES, pad_ms: int = PAD_MS):
-        self.exchanges = set(exchanges)
+        # Canonicos desde aqui: quien llama trae el id de cryptofeed (`BINANCE_FUTURES`) y el
+        # conjunto de origen trae el canonico (`binance_um`). Compararlos en crudo daria "este
+        # exchange no es secuencial" y el detector se quedaria callado justo en Binance.
+        self.exchanges = {canonico(e) for e in exchanges}
         self.pad_ms = pad_ms
         #: (exchange, symbol) -> (ultimo_id, ultimo_ts_ms)
         self.state: dict[tuple[str, str], tuple[int, int]] = {}
 
     def observe(self, exchange: str, symbol: str, trade_id: str, event_ms: int) -> Gap | None:
+        try:
+            exchange = canonico(exchange)
+        except ValueError:
+            return None  # exchange fuera del catalogo: este detector no aplica
         if exchange not in self.exchanges:
             return None
         try:
@@ -316,6 +325,18 @@ def merge(gaps: Iterable[Gap]) -> list[Gap]:
     return out
 
 
+def canonicaliza(gap: Gap) -> Gap:
+    """El `exchange` del hueco pasa a su forma canonica.
+
+    El ledger es donde se mezclan huecos del watchdog (cryptofeed, `BINANCE_FUTURES`) y de la
+    busqueda de cobertura (que lee lo que hay en la tabla, `binance_um` si ya se migro). Sin
+    esto, un mismo exchange vive bajo dos claves en `open_keys` y el reparador claim()a uno de
+    los dos mientras el otro se queda `open` para siempre.
+    """
+    return Gap(exchange=canonico(gap.exchange), symbol=gap.symbol, dtype=gap.dtype,
+               gap_from_ms=gap.gap_from_ms, gap_to_ms=gap.gap_to_ms, reason=gap.reason)
+
+
 def pad(gap: Gap, pad_ms: int = PAD_MS) -> Gap:
     """Anade padding a ambos lados. El `ON CONFLICT` se come el solape."""
     gap.gap_from_ms = max(0, gap.gap_from_ms - pad_ms)
@@ -434,7 +455,8 @@ class GapLedger:
     # ------------------------------------------------------------------ escritura
     def record(self, gaps: Iterable[Gap]) -> list[Gap]:
         """Registra huecos, fusionando con los vivos que ya toquen. Devuelve los ids."""
-        pendientes = [pad(g, self.pad_ms) for g in gaps if g.gap_to_ms > g.gap_from_ms]
+        pendientes = [pad(canonicaliza(g), self.pad_ms)
+                      for g in gaps if g.gap_to_ms > g.gap_from_ms]
         if not pendientes:
             return []
         conn = self._require()

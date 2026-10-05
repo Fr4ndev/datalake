@@ -21,6 +21,7 @@ from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
 from bulk.logfmt import log
+from common.exchanges import canonico
 from repair.adapters.bybit import BybitAdapter
 from repair.ingest import insert_trades_por_id
 
@@ -68,7 +69,7 @@ def reconciliar_dia(conn, symbol: str, dia: date, *, modo: str = "floor",
             "  AND ts >= to_timestamp(%s/1000.0) - interval '1 minute' "
             "  AND ts <= to_timestamp(%s/1000.0) + interval '1 minute' "
             "  AND trade_id = ANY(%s::text[])",
-            ("BYBIT", symbol, desde_ms, hasta_ms, sorted(ids)))
+            (canonico("BYBIT"), symbol, desde_ms, hasta_ms, sorted(ids)))
         ya = {r[0]: r[1] for r in cur.fetchall()}
 
     fuente_ms = {f.trade_id: f.ts_ms for f in filas}
@@ -83,7 +84,7 @@ def reconciliar_dia(conn, symbol: str, dia: date, *, modo: str = "floor",
                 "nuevas": nuevas, "repetidas": len(filas) - nuevas, "conflicto_ts": conflicto}
 
     insertadas, repetidas = insert_trades_por_id(
-        conn, "BYBIT", filas, "dump", desde_ms - VENTANA_MS, hasta_ms + VENTANA_MS)
+        conn, canonico("BYBIT"), filas, "dump", desde_ms - VENTANA_MS, hasta_ms + VENTANA_MS)
     return {"symbol": symbol, "day": dia_iso, "disponibles": True, "fuente": len(filas),
             "nuevas": insertadas, "repetidas": repetidas, "conflicto_ts": conflicto}
 
@@ -121,9 +122,9 @@ def verificar_alineacion(conn, symbol: str, dia: date, modo: str = "floor") -> d
         cur.execute("SET TIME ZONE 'UTC'")
         cur.execute(
             "SELECT trade_id, EXTRACT(EPOCH FROM ts)*1000 FROM trades "
-            "WHERE exchange='BYBIT' AND symbol=%s AND ts >= to_timestamp(%s/1000.0) "
+            "WHERE exchange=%s AND symbol=%s AND ts >= to_timestamp(%s/1000.0) "
             "  AND ts <= to_timestamp(%s/1000.0) AND trade_id = ANY(%s::text[])",
-            (symbol, desde_ms, hasta_ms, ids))
+            (canonico("BYBIT"), symbol, desde_ms, hasta_ms, ids))
         db = {r[0]: r[1] for r in cur.fetchall()}
 
     if not db:

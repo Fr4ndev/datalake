@@ -191,9 +191,9 @@ def test_lock_file_does_not_break_partition_listing():
 
 def test_ensure_identity_adds_and_overwrites_columns():
     table = pa.table({"symbol": pa.array(["XXX"]), "create_time": pa.array([datetime(2020, 9, 1, tzinfo=timezone.utc)], TS)})
-    out = writer.ensure_identity(table, symbol="BTCUSDT", exchange="binance")
+    out = writer.ensure_identity(table, symbol="BTCUSDT", exchange="binance_um")
     assert out.column("symbol")[0].as_py() == "BTCUSDT"
-    assert out.column("exchange")[0].as_py() == "binance"
+    assert out.column("exchange")[0].as_py() == "binance_um"
     assert out.column_names[:2] == ["symbol", "exchange"]
 
 
@@ -210,7 +210,7 @@ def test_metrics_time_column_name_is_respected():
 def test_manifest_append_and_read():
     manifest.append(
         manifest.Entry(
-            exchange="binance",
+            exchange="binance_um",
             symbol="BTCUSDT",
             dtype="klines",
             period="monthly:2020-01",
@@ -226,10 +226,10 @@ def test_manifest_append_and_read():
 
 
 def test_manifest_done_keys_drives_resume():
-    key = ("binance", "BTCUSDT", "klines", "monthly:2020-02")
+    key = ("binance_um", "BTCUSDT", "klines", "monthly:2020-02")
     assert key not in manifest.done_keys()
     manifest.append(
-        manifest.Entry(exchange="binance", symbol="BTCUSDT", dtype="klines", period="monthly:2020-02", file="x", status="done")
+        manifest.Entry(exchange="binance_um", symbol="BTCUSDT", dtype="klines", period="monthly:2020-02", file="x", status="done")
     )
     assert key in manifest.done_keys()
 
@@ -239,7 +239,7 @@ def test_manifest_latest_status_wins():
     for status in ("failed", "done"):
         manifest.append(
             manifest.Entry(
-                exchange="binance",
+                exchange="binance_um",
                 symbol="BTCUSDT",
                 dtype="klines",
                 period="monthly:2020-03",
@@ -247,16 +247,16 @@ def test_manifest_latest_status_wins():
                 status=status,
             )
         )
-    assert ("binance", "BTCUSDT", "klines", "monthly:2020-03") in manifest.done_keys()
+    assert ("binance_um", "BTCUSDT", "klines", "monthly:2020-03") in manifest.done_keys()
 
 
 def test_manifest_tolerates_truncated_last_line():
     """Un SIGKILL escribiendo el manifest no puede invalidar el historico."""
     manifest.append(
-        manifest.Entry(exchange="binance", symbol="BTCUSDT", dtype="klines", period="monthly:2020-04", file="x", status="done")
+        manifest.Entry(exchange="binance_um", symbol="BTCUSDT", dtype="klines", period="monthly:2020-04", file="x", status="done")
     )
     with manifest.config.manifest_path().open("a", encoding="utf-8") as fh:
-        fh.write('{"exchange": "binance", "sym')  # linea a medias
+        fh.write('{"exchange": "binance_um", "sym')  # linea a medias
     entries = manifest.read_all()
     assert len(entries) == 1
 

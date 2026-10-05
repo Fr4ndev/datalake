@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from common.exchanges import canonico
+
 TRADE_COLS = ("symbol", "exchange", "trade_id", "ts", "receipt_ts", "side", "price",
               "amount", "notional", "source")
 TRADE_TYPES = ("text", "text", "text", "timestamptz", "timestamptz", "text",
@@ -64,7 +66,12 @@ def _upsert_sql(table: str, cols: tuple[str, ...], types: tuple[str, ...],
 
 
 def filas_trade(exchange: str, rows) -> list[tuple]:
-    """`(exchange, symbol, trade_id, ts, receipt, side, price, amount, notional, source)`."""
+    """`(exchange, symbol, trade_id, ts, receipt, side, price, amount, notional, source)`.
+
+    El exchange se canoniza aqui y no en quien llama: todo lo que acaba en `INSERT` pasa por estas
+    funciones, asi que es el ultimo sitio donde un alias podria colarse en la tabla.
+    """
+    exchange = canonico(exchange)
     out = []
     for r in rows:
         out.append((r.symbol, exchange, r.trade_id,
@@ -129,6 +136,7 @@ def insert_candles(conn, exchange: str, rows) -> int:
     de la vela; si la anterior estaba a medias (o no existia) lo correcto es sobrescribir, no
     ignorar. Con `DO NOTHING` una vela reparada no se aplicaria nunca.
     """
+    exchange = canonico(exchange)
     if not rows:
         return 0
     datos = []

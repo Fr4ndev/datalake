@@ -31,7 +31,7 @@ needs_db = pytest.mark.skipif(not DSN, reason="requiere MIGRATE_DSN o POSTGRES_P
 HORA = 3600_000
 
 
-def gap(desde, hasta, dtype="trades", exchange="BINANCE_FUTURES", reason="silence") -> Gap:
+def gap(desde, hasta, dtype="trades", exchange="binance_um", reason="silence") -> Gap:
     return Gap(exchange=exchange, symbol="BTCUSDT", dtype=dtype,
                gap_from_ms=desde, gap_to_ms=hasta, reason=reason)
 
@@ -274,7 +274,7 @@ def test_un_baneo_no_cierra_el_hueco():
     from repair.http import Banned
 
     class AdapterQueFalla:
-        exchange = "BINANCE_FUTURES"
+        exchange = "binance_um"
 
         def can_repair(self, g):
             return True, None
@@ -285,7 +285,7 @@ def test_un_baneo_no_cierra_el_hueco():
     w = Worker.__new__(Worker)
     w.ledger = LedgerFalso()
     w.conn = object()
-    w.adaptadores = {"BINANCE_FUTURES": AdapterQueFalla()}
+    w.adaptadores = {"binance_um": AdapterQueFalla()}
     g = gap(1000, 2000)
     g.attempts = 2
     w.reparar(g)
@@ -301,7 +301,7 @@ def test_insert_trades_por_id_no_duplica_ni_sigue_la_pk():
 
     from repair.ingest import insert_trades, insert_trades_por_id
 
-    exchange = "BINANCE_FUTURES"
+    exchange = "binance_um"
     g = gap(0, 10_000)
     fila = TradeRow("dup-1", 5000, "buy", 100.0, 0.5, "BTCUSDT")
     # Mismo trade_id, ts con 1 ms de diferencia: la PK`(ts, trade_id)` NO lo detecta.
@@ -344,7 +344,7 @@ def test_fusion_de_gaps_no_borra_filas():
         lg.record([gap(base + 20_000, base + 30_000)])
         lg.record([gap(base + 5_000, base + 25_000)])
         filas = lg.list_gaps(limit=50)
-        vivas = [f for f in filas if f.exchange == "BINANCE_FUTURES" and f.symbol == "BTCUSDT"
+        vivas = [f for f in filas if f.exchange == "binance_um" and f.symbol == "BTCUSDT"
                  and f.dtype == "trades" and base <= f.gap_from_ms <= base + 100_000]
         canonicas = [f for f in vivas if f.status in ("open", "repairing")]
         fundidas = [f for f in vivas if f.status == "merged"]
@@ -375,22 +375,28 @@ def test_coverage_de_velopes_candles_usa_open_time():
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute("SET TIME ZONE 'UTC'")
         conn.execute("INSERT INTO candles_1m (symbol, exchange, open_time, open, high, low, "
-                     "close, volume) VALUES ('BTCUSDT','TESTEX',"
+                     "close, volume) VALUES ('TESTBTCUSDT','TESTEX',"
                      "to_timestamp(1700000000),1,1,1,1,1) ON CONFLICT DO NOTHING")
         # Referencia independiente: el propio Postgres sobre `open_time`. Si `coverage()` preguntase
         # por otra columna, daria otro valor o reventaria.
         cur = conn.execute("SELECT EXTRACT(EPOCH FROM max(open_time))*1000 FROM candles_1m "
-                           "WHERE exchange='TESTEX' AND symbol='BTCUSDT'")
+                           "WHERE exchange='TESTEX' AND symbol='TESTBTCUSDT'")
         esperado = cur.fetchone()[0]
-    lg = GapLedger(DSN)
-    lg.open()
     try:
-        cov = lg.coverage()
+        lg = GapLedger(DSN)
+        lg.open()
+        try:
+            cov = lg.coverage()
+        finally:
+            lg.close()
+        ms = cov.last_ms.get(("TESTEX", "TESTBTCUSDT", "candles"))
+        assert ms is not None, "candles no aparece en la cobertura"
+        assert abs(esperado - ms) < 1, (ms, esperado)
     finally:
-        lg.close()
-    ms = cov.last_ms.get(("TESTEX", "BTCUSDT", "candles"))
-    assert ms is not None, "candles no aparece en la cobertura"
-    assert abs(esperado - ms) < 1, (ms, esperado)
+        # La fila se va: `coverage()` sin claves lee TODAS las tablas y un `TESTBTCUSDT` con una
+        # vela de 2023 hace que este test dependa de datos que nadie ha pedido.
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute("DELETE FROM candles_1m WHERE exchange='TESTEX'")
 
 def test_binance_cubre_por_ventana_consultada_y_no_por_el_ultimo_trade():
     """`covered_through` es el fin de la ventana pedida, no el ts del ultimo trade.
@@ -441,7 +447,7 @@ def test_el_worker_cae_al_volcado_cuando_el_rest_no_alcanza():
     w.conn = object()
     ad = _AdaptadorConVolcado()
     ad.llamadas = []
-    w.adaptadores = {"BINANCE_FUTURES": ad}
+    w.adaptadores = {"binance_um": ad}
     w._insertar = lambda g, res: (1, "anti-join por trade_id")
     g = gap(1000, 2000)
     g.attempts = 0
@@ -468,7 +474,7 @@ def test_sin_metodo_de_volcado_no_pasa_nada():
     w = Worker.__new__(Worker)
     w.ledger = LedgerFalso()
     w.conn = object()
-    w.adaptadores = {"BINANCE_FUTURES": _AdaptadorSoloRest()}
+    w.adaptadores = {"binance_um": _AdaptadorSoloRest()}
     w._insertar = lambda g, res: (1, "insert por PK")
     g = gap(1000, 2000)
     g.attempts = 0
@@ -498,10 +504,62 @@ def test_el_volcado_no_pisa_lo_que_ya_trajo_el_rest():
     w.conn = object()
     ad = _Ambos()
     ad.llamadas = []
-    w.adaptadores = {"BINANCE_FUTURES": ad}
+    w.adaptadores = {"binance_um": ad}
     w._insertar = _ins
     g = gap(1000, 2000)
     g.attempts = 0
     w.reparar(g)
     assert inserts == ["dump", "rest"], inserts
     assert w.ledger.fin[-1][1] == "repaired"
+
+
+def test_los_limites_de_http_se_buscan_por_exchange_canonico():
+    """`Client("okx")` y `Client("BYBIT")` deben caer en SU cubo, no en el de hyperliquid.
+
+    El fallo que fijamos aqui era invisible: `EXCHANGE_KEY` era un diccionario escrito a mano
+    con las claves mezcladas (canonicas de una parte, nombres de cryptofeed de otra), asi que
+    `EXCHANGE_KEY.get("okx", "hyperliquid")` caia al cubo de hyperliquid y OKX quedaba con 60 de
+    capacidad en vez de 40. No reventaba nada: limitaba a otro ritmo, y eso se manifesto despues
+    como 429 sin explicacion.
+    """
+    from repair.http import LIMITS, Client, clave_exchange
+
+    for alias, canonico_esperado in [
+        ("BINANCE_FUTURES", "binance_um"),
+        ("BinanceFuturesUM", "binance_um"),
+        ("OKX", "okx"),
+        ("BYBIT", "bybit"),
+        ("BITGET", "bitget"),
+        ("HYPERLIQUID", "hyperliquid"),
+    ]:
+        assert clave_exchange(alias) == canonico_esperado, alias
+
+    assert set(LIMITS) == {"binance_um", "okx", "bitget", "bybit", "hyperliquid"}
+
+    # Los limites de cada exchange son los suyos, no los de otro.
+    c = Client()
+    assert c.weight("okx") == LIMITS["okx"][2]
+    assert c.weight("bybit") == LIMITS["bybit"][2]
+    assert c.weight("BINANCE_FUTURES") == LIMITS["binance_um"][2]
+
+
+def test_un_solo_cubo_por_exchange_aunque_lleguen_dos_grafias():
+    """"OKX" y "okx" no pueden tener cubos separados: seria el doble de limite para el mismo."""
+    from repair.http import LIMITS, Client
+
+    c = Client()
+    b1 = c._bucket("OKX")
+    b2 = c._bucket("okx")
+    assert b1 is b2, "dos cubos para el mismo exchange: el limite esta partido en dos"
+    assert len(c.buckets) == 1
+    assert b1.capacity == LIMITS["okx"][0]
+
+
+def test_los_adaptadores_declaran_el_exchange_canonico():
+    """Cada adapter escribe bajo su nombre canonico; si no, la reparacion crea otra serie."""
+    from repair.adapters import bitget, bybit, hyperliquid, okx
+
+    assert bitget.BitgetAdapter.exchange == "bitget"
+    assert bybit.BybitAdapter.exchange == "bybit"
+    assert hyperliquid.HyperliquidAdapter.exchange == "hyperliquid"
+    assert okx.OKXAdapter.exchange == "okx"

@@ -22,7 +22,7 @@ MAX_PAGINAS = 2000
 
 
 class OKXAdapter(Adapter):
-    exchange = "OKX"
+    exchange = "okx"
     name = "okx"
 
     def __init__(self, client):

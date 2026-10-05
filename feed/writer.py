@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from common.db import conninfo
+from common.exchanges import canonico
 from bulk.logfmt import log
 
 #: cryptofeed entrega epoch en segundos, pero no esta garantizado para todos los exchanges
@@ -199,7 +200,7 @@ class Store:
             return
         side = t.side if t.side in ("buy", "sell") else "buy"
         self.writers["trades"].push(
-            (symbol, t.exchange, str(t.id), ts, to_utc(receipt), side, price, amount, price * amount),
+            (symbol, canonico(t.exchange), str(t.id), ts, to_utc(receipt), side, price, amount, price * amount),
             ingest_ts=time.monotonic(),
         )
 
@@ -211,7 +212,7 @@ class Store:
             self.writers["funding"].rows_dropped += 1
             return
         self.writers["funding"].push(
-            (symbol, f.exchange, ts, rate, _f(getattr(f, "mark_price", None)), to_utc(getattr(f, "next_funding_time", None)))
+            (symbol, canonico(f.exchange), ts, rate, _f(getattr(f, "mark_price", None)), to_utc(getattr(f, "next_funding_time", None)))
         )
 
     def add_open_interest(self, oi, receipt) -> None:
@@ -221,7 +222,7 @@ class Store:
         if not symbol or ts is None or val is None:
             self.writers["open_interest"].rows_dropped += 1
             return
-        self.writers["open_interest"].push((symbol, oi.exchange, ts, val))
+        self.writers["open_interest"].push((symbol, canonico(oi.exchange), ts, val))
 
     def add_liquidation(self, liq, receipt) -> None:
         symbol = self._sym(liq.exchange, liq.symbol)
@@ -232,7 +233,7 @@ class Store:
             return
         side = liq.side if liq.side in ("buy", "sell") else "buy"
         self.writers["liquidations"].push(
-            (symbol, liq.exchange, ts, side, price, qty, price * qty)
+            (symbol, canonico(liq.exchange), ts, side, price, qty, price * qty)
         )
 
     def add_candle(self, c, receipt) -> None:
@@ -250,7 +251,7 @@ class Store:
             return
         n = getattr(c, "trades", None)
         self.writers["candles"].push(
-            (symbol, c.exchange, ts, o, h, lo, cl, v, int(n) if n is not None else None)
+            (symbol, canonico(c.exchange), ts, o, h, lo, cl, v, int(n) if n is not None else None)
         )
 
     #: Cifras que el proyecto trata como el mismo perpetuo. El lake solo tiene perps USDT, asi

@@ -41,7 +41,7 @@ REST_MAX_AGE_MS = 47 * 3600 * 1000
 
 
 class BinanceFuturesAdapter(Adapter):
-    exchange = "BINANCE_FUTURES"
+    exchange = "binance_um"
     name = "binance"
 
     def __init__(self, client: Client, now_ms: int | None = None):

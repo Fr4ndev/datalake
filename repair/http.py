@@ -37,6 +37,7 @@ import urllib.parse
 import urllib.request
 
 from bulk.logfmt import log
+from common.exchanges import canonico
 
 USER_AGENT = "cripto-marketdata/0.2 (gap-repair)"
 
@@ -84,23 +85,30 @@ class Bucket:
         self.updated = ahora
 
 
-#: exchange -> (capacidad del cubo, refill por segundo, peso de una peticion)
+#: exchange canonico -> (capacidad del cubo, refill por segundo, peso de una peticion).
+#: Las claves son las de `common.exchanges.CANONICOS`: un cubo por exchange, con su nombre.
 LIMITS: dict[str, tuple[float, float, float]] = {
-    "binance_futures": (20.0, 2.0, 20.0),
+    "binance_um": (20.0, 2.0, 20.0),
     "okx": (40.0, 10.0, 1.0),
     "bitget": (20.0, 10.0, 1.0),
     "bybit": (100.0, 20.0, 1.0),
     "hyperliquid": (60.0, 20.0, 1.0),
 }
 
-#: Nombres de cryptofeed -> clave de `LIMITS`.
-EXCHANGE_KEY = {
-    "BINANCE_FUTURES": "binance_futures",
-    "OKX": "okx",
-    "BITGET": "bitget",
-    "BYBIT": "bybit",
-    "HYPERLIQUID": "hyperliquid",
-}
+
+def clave_exchange(exchange: str) -> str:
+    """Limites de `exchange`, admitiendo cualquier grafia (cryptofeed o lake).
+
+    Antes esto era un diccionario escrito a mano, `"OKX": "okx"` junto a `"bitget": "bitget"`, y
+    por eso `Client("okx")` y `Client("bybit")` -ya canonicos- no aparecian en el mapa y caian al
+    cubo de hyperliquid: OKX con 60 de capacidad en vez de 40, y Bybit con 60 en vez de 100. No
+    reventaba nada; solo estaba limitando a otro ritmo del que creiamos, que es exactamente como
+    aparecen luego los 429 sin explicacion.
+    """
+    try:
+        return canonico(exchange)
+    except KeyError:
+        return exchange.lower()
 
 
 class Client:
@@ -119,14 +127,17 @@ class Client:
         self.esperas = 0.0
 
     def _bucket(self, exchange: str) -> Bucket:
-        cap, refill, _ = LIMITS[EXCHANGE_KEY.get(exchange, "hyperliquid")]
-        b = self.buckets.get(exchange)
+        # Un cubo por exchange CANONICO: indexarlo por la grafina que llega haria que "OKX" y
+        # "okx" tuvieran cada uno su cubo, es decir el doble de limite para el mismo exchange.
+        clave = clave_exchange(exchange)
+        cap, refill, _ = LIMITS[clave]
+        b = self.buckets.get(clave)
         if b is None:
-            b = self.buckets[exchange] = Bucket(cap, refill)
+            b = self.buckets[clave] = Bucket(cap, refill)
         return b
 
     def weight(self, exchange: str) -> float:
-        return LIMITS[EXCHANGE_KEY.get(exchange, "hyperliquid")][2]
+        return LIMITS[clave_exchange(exchange)][2]
 
     # ------------------------------------------------------------------ ban
     def penalize(self, exchange: str, seconds: float) -> None:

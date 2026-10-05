@@ -57,7 +57,7 @@ def ms_desde_segundos(valor: str | float, modo: str = "floor") -> int:
 
 
 class BybitAdapter(Adapter):
-    exchange = "BYBIT"
+    exchange = "bybit"
     name = "bybit"
 
     def __init__(self, client):

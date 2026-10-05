@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from common.db import assert_session_is_utc, conninfo, duckdb_utc
@@ -64,6 +65,48 @@ def log(event: str, **fields) -> None:
 
 def lake_dir() -> Path:
     return Path(os.environ.get("LAKE_DIR", "/data/lake"))
+
+
+def cobertura_lake(root: Path, dtype: str, exchange: str, symbol: str, tf: str | None = None):
+    """Primer y ultimo `open_time` del lake, leyendo SOLO los metadatos del Parquet.
+
+    Sin esto, pedir un rango que el lake no cubre devuelve `rows_read=0` sin explicar por que, y
+    `reason=no_files` llega a significar dos cosas distintas ("el exchange no publico esto" y
+    "el lake llega hasta ayer y tu pides la semana pasada"). Con estos dos numeros el log dice si
+    lo que falta es datos de origen o rango pedido.
+    """
+    import pyarrow.parquet as pq
+
+    lo = hi = None
+    for f in parquet_files(root, dtype, exchange, symbol, tf):
+        try:
+            md = pq.ParquetFile(f)
+        except Exception:  # noqa: BLE001 - un fichero ilegible no puede romper la cobertura
+            continue
+        idx = None
+        for i, name in enumerate(md.schema_arrow.names):
+            if name in ("open_time", "ts", "calc_time", "create_time"):
+                idx = i
+                break
+        if idx is None:
+            continue
+        try:
+            stats = md.metadata.row_group(0).column(idx).statistics
+            f_lo, f_hi = (stats.min, stats.max) if stats is not None else (None, None)
+        except Exception:  # noqa: BLE001 - sin estadisticas: no hay cobertura que informar
+            continue
+        if f_lo is None or f_hi is None:
+            continue
+        # Las estadisticas vienen como datetime (pyarrow) o como entero (columna numerica).
+        # Cualquiera de los dos casos es un instante UTC: el lake se escribe en UTC.
+        def _dt(v):
+            if isinstance(v, datetime):
+                return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+            return datetime.fromtimestamp(v / 1000.0, tz=timezone.utc)
+        f_lo, f_hi = _dt(f_lo), _dt(f_hi)
+        lo = f_lo if lo is None or f_lo < lo else lo
+        hi = f_hi if hi is None or f_hi > hi else hi
+    return lo, hi
 
 
 def parquet_files(root: Path, dtype: str, exchange: str, symbol: str, tf: str | None = None):
@@ -207,14 +250,21 @@ class Loader:
         self,
         dtype: str,
         symbol: str,
-        exchange: str = "binance",
+        exchange: str = "binance_um",
         tf: str | None = None,
         since=None,
         until=None,
         files=None,
         refresh: bool = True,
+        escribir: bool = True,
     ) -> LoadResult:
-        """Carga un dtype del lake a su tabla. Idempotente."""
+        """Carga un dtype del lake a su tabla. Idempotente.
+
+        `escribir=False` lee y cuenta sin insertar nada. Lo usan los tests: `test_el_bucket_por_
+        dia_y_ano_es_utc` comprobaba el bucketing en UTC con una fila de 2019 y, al pasar por
+        `load()` de verdad, la dejaba escrita en la tabla `funding` de produccion. Un test que
+        escribe en la base real no es un test: es una carga disfrazada.
+        """
         from loader.targets import TIME_COLUMN
 
         t0 = time.monotonic()
@@ -225,8 +275,10 @@ class Loader:
         paths = list(files) if files is not None else parquet_files(lake_dir(), dtype, exchange, symbol, tf)
         if not paths:
             res.elapsed = time.monotonic() - t0
-            log("load_skipped", dtype=dtype, symbol=symbol, reason="no_files")
+            log("load_skipped", dtype=dtype, symbol=symbol, exchange=exchange,
+                reason="no_files")
             return res
+        cov_lo, cov_hi = cobertura_lake(lake_dir(), dtype, exchange, symbol, tf)
         res.files = len(paths)
 
         if self._duck is None:
@@ -235,6 +287,9 @@ class Loader:
         try:
             for batch, read in self._read_batches(paths, target, time_col, since, until):
                 res.rows_read += read
+                if not escribir:
+                    res.rows_sent += read
+                    continue
                 try:
                     inserted = self._write_batch(target, batch)
                 except Exception as exc:  # noqa: BLE001
@@ -249,6 +304,16 @@ class Loader:
 
         res.elapsed = time.monotonic() - t0
         log("load", **res.as_log_fields())
+
+        # Habia ficheros pero ninguno cae en el rango pedido. Sin esta linea el operador lee
+        # `rows_read=0` y no sabe si el exchange no publico ese dia o se ha pedido una fecha que el
+        # lake todavia no cubre (el lake se queda dias por detras del presente).
+        if res.files and not res.rows_read:
+            log("load_range_empty", dtype=dtype, symbol=symbol, exchange=exchange, tf=tf,
+                lake_first_ts=cov_lo.isoformat() if cov_lo else None,
+                lake_last_ts=cov_hi.isoformat() if cov_hi else None,
+                since=since.isoformat() if since else None,
+                until=until.isoformat() if until else None)
 
         # Se refresca si se ha LEIDO algo del rango, no solo si se ha insertado. Si el refresh
         # fallara (p.ej. una cagg recien creada) y se relanzara la carga, la segunda pasada

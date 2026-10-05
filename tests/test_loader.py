@@ -115,7 +115,7 @@ def test_el_bucket_por_dia_y_ano_es_utc(tmp_path: Path, monkeypatch):
     import duckdb
 
     monkeypatch.setenv("LAKE_DIR", str(tmp_path))
-    part = tmp_path / "binance" / "funding" / "symbol=BTCUSDT" / "tf=8h" / "year=2019"
+    part = tmp_path / "binance_um" / "funding" / "symbol=BTCUSDT" / "tf=8h" / "year=2019"
     part.mkdir(parents=True)
     fila = (2019, 12, 31, 23, 30)
     con = duckdb.connect()
@@ -124,7 +124,7 @@ def test_el_bucket_por_dia_y_ano_es_utc(tmp_path: Path, monkeypatch):
         "last_funding_rate DOUBLE)"
     )
     con.execute(
-        "INSERT INTO t VALUES ('BTCUSDT','binance',TIMESTAMPTZ '2019-12-31 23:30:00+00', 0.1)"
+        "INSERT INTO t VALUES ('BTCUSDT','binance_um',TIMESTAMPTZ '2019-12-31 23:30:00+00', 0.1)"
     )
     con.execute("COPY t TO ? (FORMAT PARQUET)", [str(part / "part.parquet")])
     con.close()
@@ -137,8 +137,10 @@ def test_el_bucket_por_dia_y_ano_es_utc(tmp_path: Path, monkeypatch):
         ).fetchone() == (2019, datetime(2019, 12, 31, 0, 0, tzinfo=UTC))
 
         # Y el filtro por rango, que tambien tiene que respectar el rango pedido.
-        res_2019 = ld.load("funding", symbol="BTCUSDT", until=datetime(2020, 1, 1, tzinfo=UTC))
-        res_2020 = ld.load("funding", symbol="BTCUSDT", since=datetime(2020, 1, 1, tzinfo=UTC))
+        res_2019 = ld.load("funding", symbol="BTCUSDT", until=datetime(2020, 1, 1, tzinfo=UTC),
+                           escribir=False)
+        res_2020 = ld.load("funding", symbol="BTCUSDT", since=datetime(2020, 1, 1, tzinfo=UTC),
+                           escribir=False)
 
     assert res_2019.rows_read == 1, "la fila es de 2019-12-31 UTC"
     assert res_2020.rows_read == 0, "no hay nada de 2020 en adelante"
@@ -193,36 +195,51 @@ def test_carga_real_es_idempotente(tmp_path: Path):
     intermitente. Y la cuenta esperada es la del rango, no la de antes mas la insertada: el DELETE
     previo ya ha vaciado el rango, asi que al final hay exactamente un dia de velas.
     """
-    from common.db import psycopg_utc
-    from loader.loader import lake_dir
+    import duckdb
 
-    symbol = "BTCUSDT"
-    # `lake_dir()`, no una ruta relativa: dentro del contenedor el lake esta en `/data/lake` y
-    # `Path("lake/...")` no existe, asi que el test se saltaba sin llegar a comprobar nada.
-    src = lake_dir() / "binance" / "klines" / f"symbol={symbol}" / "tf=1m" / "year=2024" / "part.parquet"
-    if not src.is_file():
-        pytest.skip(f"el lake no tiene klines de 2024 en {lake_dir()}")
+    from common.db import psycopg_utc
+
+    # Simbolo propio y datos propios en `tmp_path`. Antes este test leia un dia REAL de BTCUSDT
+    # del lake y hacia `DELETE FROM candles_1m` sobre ese rango: un test que borra la tabla de
+    # produccion. Si el lake no estaba montado se saltaba y no hacia falta fixes; cuando si
+    # estaba, vaciaba un dia entero de historico para volver a meterlo.
+    symbol = "TESTCARGABTCUSDT"
     since = datetime(2024, 1, 1, tzinfo=UTC)
     until = datetime(2024, 1, 2, tzinfo=UTC)
+    part = tmp_path / "binance_um" / "klines" / f"symbol={symbol}" / "tf=1m" / "year=2024"
+    part.mkdir(parents=True)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t AS SELECT 'TESTCARGABTCUSDT'::VARCHAR AS symbol, "
+                "'binance_um'::VARCHAR AS exchange, "
+                "TIMESTAMPTZ '2024-01-01 00:00:00+00' + INTERVAL (i) MINUTE AS open_time, 1::DOUBLE "
+                "AS open, 1::DOUBLE AS high, 1::DOUBLE AS low, 1::DOUBLE AS close, 1::DOUBLE AS volume, "
+                "TIMESTAMPTZ '2024-01-01 00:00:59+00' + INTERVAL (i) MINUTE AS close_time, "
+                "1::DOUBLE AS quote_volume, 1::BIGINT AS trades, 1::DOUBLE AS taker_buy_volume, "
+                "1::DOUBLE AS taker_buy_quote_volume, '1m'::VARCHAR AS tf "
+                "FROM range(0, 1440) tbl(i)")
+    con.execute("COPY t TO ? (FORMAT PARQUET)", [str(part / "part.parquet")])
+    con.close()
     rango = "symbol=%s AND open_time >= %s AND open_time < %s"
 
     with psycopg_utc() as pg:
         with pg.cursor() as cur:
-            cur.execute(f"SELECT count(*) FROM candles_1m WHERE {rango}", (symbol, since, until))
-            antes = cur.fetchone()[0]
-            cur.execute(f"DELETE FROM candles_1m WHERE {rango}", (symbol, since, until))
+            cur.execute("DELETE FROM candles_1m WHERE symbol=%s", (symbol,))
             pg.commit()
 
         with Loader() as ld:
-            r1 = ld.load("klines", symbol=symbol, since=since, until=until, refresh=False)
-            r2 = ld.load("klines", symbol=symbol, since=since, until=until, refresh=False)
+            r1 = ld.load("klines", symbol=symbol, since=since, until=until, refresh=False,
+                         files=[part / "part.parquet"])
+            r2 = ld.load("klines", symbol=symbol, since=since, until=until, refresh=False,
+                         files=[part / "part.parquet"])
 
         with pg.cursor() as cur:
             cur.execute(f"SELECT count(*) FROM candles_1m WHERE {rango}", (symbol, since, until))
             total = cur.fetchone()[0]
+            cur.execute("DELETE FROM candles_1m WHERE symbol=%s", (symbol,))
+            pg.commit()
 
+    antes = 0
     assert not r1.errors and not r2.errors
-    assert antes >= 0
     # 1440 velas de 1m en un dia.
     assert r1.rows_inserted == 1440, f"esperaba 1440, insertadas {r1.rows_inserted}"
     # Este es el AC: la segunda carga del mismo rango no anade ninguna fila.
