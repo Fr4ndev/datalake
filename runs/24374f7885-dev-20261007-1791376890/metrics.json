@@ -1,0 +1,87 @@
+{
+  "gates": [
+    {
+      "nombre": "n_trades_dev",
+      "pasa": true,
+      "umbral": ">= 100",
+      "valor": 1426
+    },
+    {
+      "nombre": "sharpe_dev",
+      "pasa": false,
+      "umbral": "> 0",
+      "valor": -1.309695
+    },
+    {
+      "nombre": "ic95_inferior",
+      "pasa": false,
+      "umbral": "> 0",
+      "valor": -2.084486
+    },
+    {
+      "nombre": "deflated_sharpe",
+      "pasa": false,
+      "umbral": ">= 0.95",
+      "valor": 0.0
+    },
+    {
+      "nombre": "p_aleatorias",
+      "pasa": false,
+      "umbral": "<= 0.05",
+      "valor": 0.555
+    },
+    {
+      "nombre": "estabilidad_anual",
+      "pasa": false,
+      "umbral": ">= 0.7",
+      "valor": 0.0
+    },
+    {
+      "nombre": "montecarlo_maxdd_p95",
+      "pasa": true,
+      "umbral": "<= 0.50",
+      "valor": 0.303071
+    },
+    {
+      "nombre": "meseta_vecindad",
+      "pasa": false,
+      "umbral": ">= 0.5 (45 combos)",
+      "valor": 0.0
+    },
+    {
+      "nombre": "costes_x2_sharpe",
+      "pasa": false,
+      "umbral": "> 0",
+      "valor": -1.210387
+    },
+    {
+      "nombre": "retraso_1barra_sharpe",
+      "pasa": false,
+      "umbral": "> 0",
+      "valor": -1.334526
+    }
+  ],
+  "metrics": {
+    "costes_x2_sharpe": -1.210387,
+    "dsr": 0.0,
+    "frac_anios_pos": 0.0,
+    "funding_total": 4.434233,
+    "ic95_hi": 0.0,
+    "ic95_lo": -2.084486,
+    "kurtosis": 544.086154,
+    "max_dd": 1.001129,
+    "mc_maxdd_medio": 0.270697,
+    "mc_maxdd_p95": 0.303071,
+    "n_anios": 4,
+    "n_trades": 1426,
+    "n_trials": 45,
+    "p_aleatorias": 0.555,
+    "retorno_total": -1.001133,
+    "retraso_1barra_sharpe": -1.334526,
+    "segundos": 127.35,
+    "sharpe": -1.309695,
+    "skew": -22.082023,
+    "vecindad_sharpe_media": -1.353013
+  },
+  "veredicto": "REJECT"
+}

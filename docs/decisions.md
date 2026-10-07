@@ -407,3 +407,85 @@ impide `repaired` por construcción.
 ### D6. Bitget trades por REST: no soportado, sin prioridad
 Bitget `fills-history` tiene paginado no trivial: al usar `startTime/endTime` junto a otros parámetros, el cursor no avanza en algunos casos (se repiten las mismas páginas). Se han medido llamadas reales y, por decisión del usuario, no se invierte tiempo en arreglarlo ahora.
 Los huecos afectos permanecen `partial` con nota explícita. El WS sigue capturando trades. Prioridad: baja.
+
+### D47. Orden de eventos y convenciones del motor de backtest (`bt/engine.py`)
+Motor propio en numba (decision B1), con el orden por barra fijado:
+1. orden pendiente (decidida en el cierre de `i-1`) en el OPEN de `i-1+1` con slippage adverso y fee;
+2. **funding en su timestamp, sobre la posicion YA actualizada por el fill de esa barra** (si caen
+   juntos, el cargo es sobre la posicion nueva);
+3. stops intrabarra: SL y TP en la misma barra -> SL; gap a traves del stop -> fill al `open` (peor caso);
+4. liquidacion (margen aislado) al `close`;
+5. mark-to-market al `close`.
+
+Tres convenciones que costaron un rediseño:
+- `target[i]` es en **unidades del activo**, no en fraccion. Si las unidades se recalcularan contra
+  el precio de cada barra, el objetivo cambiaria siempre y el motor rebalancearia en TODAS las
+  barras (`n_trades = n_bars`). Se calculan una vez en la entrada y se congelan.
+- **Equity <= 0 corta la entrada de nuevas ordenes.** Sin esto, con la posicion plana el paso 4 no
+  actua (solo mira `pos != 0`) y la equity se va a -741.000 en un backtest de 1M de operaciones.
+- `cash0` es obligatorio: es el colateral. Sin el, cualquier compra deja la equity negativa y el
+  motor liquida en la primera comprobacion.
+
+### D48. Restaurar un volcado de TimescaleDB exige `timescaledb_pre_restore()`/`post_restore()`
+Sin esas dos llamadas, `pg_restore` falla en los COPY de los chunks con
+`could not find hypertable with id N`. El detalle peligroso: **no aborta limpio**; devuelve `exit=1`
+pero solo pierde los chunks afectados y el resto de tablas queda correcta, asi que un conteo parcial
+no delata la perdida. Medido con el volcado de 2026-10-07: el chunk `_hyper_1_100_chunk` de
+`candles_1m` (10080 velas, 2021-06-10..16) se perdia al 100% y todo lo demás cuadraba.
+Ademas el volcado NO trae esas llamadas: hay que ejecutarlas en la BD destino.
+Procedimiento obligatorio en `ops/pgrestore-verify.sh`.
+
+### D49. La verificacion de una restauracion se mide contra el propio volcado, no contra la BD viva
+La BD viva crece sin parar (feed) y ademas el repair cierra huecos de 2021 con `ts` antiguo, asi
+que siempre tendra mas filas que el volcado: comparar contra ella da falsos positivos imposibles de
+eliminar acotando por fecha. `ops/pgbackup.sh` guarda dos ficheros de conteos, ANTES y DESPUES del
+`pg_dump`; el snapshot de pg_dump cae entre ambos y las tablas solo crecen, de modo que la
+restauracion es valida si cada conteo cae en ese intervalo. Con esquema estatico (`bt_runs`,
+`schema_migrations`, `ingest_gaps`) basta con igualdad exacta.
+
+### D50. `docker-compose exec` dentro de un `while read` se come el stdin
+Clasico: sin `< /dev/null`, el `exec` consume las lineas que el bucle iba a leer. En la primera
+version de la verificacion salio `event=ok total_tablas=8` tras comprobar UNA sola tabla, con
+`exit=0`. Todo `exec`/`psql` usado dentro de un bucle lleva `< /dev/null`.
+
+### D51. El runner paraleliza con `fork`, y la rejilla solo pide Sharpe
+El primer `bt run` de 4 años no terminaba en 33 min (y hubo que matarlo). Medido, el tiempo
+no estaba en el motor sino en `monte_carlo_maxdd`: 9,5 s **por combinacion**, aplicado a las 45
+combinaciones de la vecindad. Dos cambios:
+- **Metricas baratas para la rejilla** (`_sharpe_rapido`): a los vecinos descartados solo les
+  importa Sharpe y nº de operaciones (para meseta y seleccion). IC, MC, estabilidad anual y
+  sesgo se calculan una sola vez, para los parametros elegidos.
+- **MC adaptativo a la baja**: con ~700 trades se pedian 4000 permutaciones. Ahora
+  `min(n_sim, 1000)` salvo `>200_000` trades, donde baja a 200.
+- **Paralelismo `fork`** (`_pool`): rejilla y 200 estrategias aleatorias en
+  `os.cpu_count()-1` workers (3 en el N100). `fork`, no `spawn`: con `spawn` cada hijo
+  reimportaria el modulo y volveria a compilar numba. Los datos NO se serializan: se guardan
+  en `_W` **antes** de crear el Pool y los hijos los heredan por copy-on-write.
+  Numero de workers = 3 (min(4, cpus-1)), para no dejar al proceso principal sin nucleo.
+
+Resultado: run de dev **127 s** (antes >33 min sin terminar).
+
+### D52. `segundos` no puede entrar en la comparacion de determinismo
+`rerun` comparaba las metricas del registro contra las nuevas, y `segundos` (tiempo de pared)
+cambia siempre: el canario 7 habria fallado por un valor que no tiene nada que ver con el
+motor. Se excluye del intersect. Relacionado: `bt rerun` tenia una errata en el nombre de la
+clave (`diferidades`) que solo salia a la luz cuando habia diferencias — el camino feliz
+imprimia el resumen y troncaba. `reproducido=True claves_comparadas=19`.
+
+### D53. `git_sha` se lee de `.git/HEAD`, no con el binario `git`
+La imagen `loader` no lleva `git` (`sh: 1: git: not found`), asi que `git rev-parse --short`
+devolvia `desconocido` en todos los reportes y la trazabilidad del ensayo se perdia. Se lee
+`.git/HEAD`, la ref a la que apunta y `packed-refs` de respaldo, sin dependencias nuevas
+(que sumarian peso a la imagen y regla 6 fija <1.5 GB).
+
+### D54. Tiempos medidos (N100, 4核, ventana dev = 2.103.840 barras)
+| operacion | tiempo |
+|---|---|
+| `bt run --split dev` completo (45 combos + 200 aleatorias + robustez + reporte) | **127 s** |
+| carga de datos (ohlcv+funding, 4 años) | 1,9 s |
+| una combinacion (target + motor) | 0,82 s |
+| rejilla de **1.000 combinaciones**, 3 workers | **819 s (13,7 min)** |
+| `bt rerun` (repite todo y compara) | ~130 s |
+| suite `bt/tests` (8 canarios) | 28 s |
+| suite histórica `tests/` | 298 passed / 35 s |
+| verificación de restauración de 663 MB (8 tablas) | ~11 min |

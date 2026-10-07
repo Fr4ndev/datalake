@@ -45,13 +45,20 @@ Un backtest bonito no es evidencia. Cada resultado debe poder rechazarse. El sis
 1. Fixture manual de 10 trades con fees, slippage y funding calculados a mano: coincide al céntimo.
 2. Buy&hold = retorno del precio menos los costes de una entrada y una salida.
 3. Estrategia sin señales → equity plana, 0 trades.
-4. Canario aleatorio: 200 estrategias de entradas aleatorias con dirección long/short SIMÉTRICA (50/50, para que el drift de BTC no sesgue) → Sharpe medio ≤ 0 por arrastre de costes y ninguna "significativa" más allá del azar esperado. Si salen ganadoras, hay lookahead o faltan costes.
+4. Canario aleatorio: 200 estrategias de entradas aleatorias con dirección long/short SIMÉTRICA (50/50, para que el drift de BTC no sesgue) → la media del *t* de las 200 es significativamente negativa (< −3·SE) por arrastre de costes, ninguna sale a >4σ de su propia distribución, y como CONTRASEÑA la misma tanda sin costes da media ≈ 0. OJO: el *t* va sobre las observaciones, NO sobre el Sharpe anualizado (que escala por √525600 y daba 196/200 "significativas" de mentira); y el *t* paramétrico por estrategia tampoco vale, porque las exposiciones son bloques correlacionados sobre una trayectoria de mercado fija.
 5. Monotonía de costes: más fee/slippage ⇒ menor retorno, siempre.
 6. El DSL rechaza accesos al futuro (test con `close[+1]`).
 7. Determinismo: mismo spec_hash + data_snapshot + seed ⇒ métricas idénticas (`bt rerun <run_id>`).
+8. Motor propio vs vectorbt, en configuración SIN stops y SIN funding (lo único que hace que las dos semánticas difieran, decisión B1): mismos trades y misma equity con tolerancia 1e-6, y con ≥20 órdenes para que el canario no sea vacío. La señal se desplaza una barra, porque nosotros decidimos en el cierre y ejecutamos en el open siguiente.
 
 # Salida
 runs/{run_id}/: report.md (veredicto + gates + IC), metrics.json, equity.png, trades.parquet, spec.yaml. Cualquier interfaz (CLI o Telegram) devuelve veredicto, N_trials de la familia y el gate que falló, y NO puede saltarse el lock de holdout ni el registro.
 
+# Operación (medido en el N100, 4核)
+- El runner paraleliza rejilla y aleatorias con `multiprocessing` en **fork** (`fork`, no `spawn`: con `spawn` cada hijo recompila numba) usando `min(4, cpus-1)` workers. Los datos se ponen en un global ANTES de crear el Pool y los hijos los heredan por copy-on-write; nada se serializa. Workers = 1 ⇒ modo serie, que es el que usan los canarios.
+- Solo los parametros elegidos reciben las metricas caras (IC, Monte Carlo, estabilidad anual). A los vecinos descartados les basta Sharpe y nº de operaciones. El Monte Carlo adapta `n_sim` al nº de trades.
+- Tiempos reales: `bt run --split dev` completo = **127 s**; 1 combinación = 0,82 s; **1.000 combinaciones = 819 s**; `bt rerun` ≈ 130 s. Si un run no termina en ~10 min, mide antes de tocar nada.
+- `bt rerun` excluye `segundos` (tiempo de pared) de la comparación; todo lo demás debe coincidir bit a bit.
+
 # Criterio de done
-Los 7 canarios en verde; un EMA-cross trivial recorre todo el pipeline y da veredicto (se espera REJECT o INCONCLUSIVE tras costes + funding); tocar el holdout sin --final falla; rerun reproduce las métricas.
+Los 8 canarios en verde; un EMA-cross trivial recorre todo el pipeline y da veredicto (se espera REJECT o INCONCLUSIVE tras costes + funding); tocar el holdout sin --final falla; rerun reproduce las métricas.

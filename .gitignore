@@ -7,3 +7,9 @@ __pycache__/
 
 # Datos: el lake Parquet son decenas de GB. El contenido nunca va a git.
 lake/
+# Artefactos pesados de ensayos; report.md y metrics.json de runs/ si van al repo
+runs/*/equity.png
+runs/*/trades.parquet
+
+# Transcripcion de sesion (250 KB, no es codigo)
+session-*.md
