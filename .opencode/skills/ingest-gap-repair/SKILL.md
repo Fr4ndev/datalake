@@ -19,7 +19,7 @@ Además: columna source ('ws','rest','dump') en trades.
 
 # Clave de dedup (CRÍTICO)
 - PK trades: (exchange, symbol, ts, trade_id) (ts debe estar en la PK por la hypertable).
-- Normalizar ts ANTES de insertar: cryptofeed entrega float en segundos → ts_ms = round(ts*1000) entero; REST ya viene en ms. Con floats, WS y REST no deduplican por micro-diferencias.
+- Normalizar ts ANTES de insertar: **por exchange, con medición con datos reales**. Cryptofeed entrega float en segundos: la normalización (`floor` vs `round`) se mide comparando WS vs REST/volcado por trade_id. Medido: Bybit → `floor(ts*1000)` (coincide al 100% con REST en los casos medidos). Binance → medir por símbolo/día antes de fijar la regla (no asumir Bybit). REST ya viene en ms. Con floats, WS y REST no deduplican por micro-diferencias.
 - trade_id debe ser el mismo en WS y REST. Verificar en el cryptofeed clonado qué stream usa Binance para trades (aggTrade → id = `a`) y que OKX/Bitget/Bybit exponen el id nativo. Si no coincide: clave (ts_ms, price, size, side) y documentarlo en decisions.md.
 - Test: el mismo trade por vía WS-fake y REST-fake → 1 fila.
 - Insertar siempre con INSERT ... SELECT FROM unnest(...) ON CONFLICT DO NOTHING (COPY directo no soporta ON CONFLICT; ya medido).
@@ -56,3 +56,5 @@ Pruebas: `docker-compose` + `docker network disconnect` del feed-daemon 60 s y r
 6. Idempotencia: reparar dos veces el mismo gap → 0 filas nuevas. Dedup WS+REST → 1 fila por trade.
 7. Reinicio: SIGKILL + restart → gap reason=restart abierto y reparado.
 8. Validador (Fase 3): CRIT si hay gaps open > 1 h; INFO por cada unrecoverable.
+### Programación
+`ops/daily.sh` debe ejecutarse de forma periódica en el host (cron del usuario o systemd timer). Verificar con una ejecución programada real y dejar el log accesible.
