@@ -222,6 +222,12 @@ class Worker:
         completo = any(self._cubre(gap, r) and r.limitation is None
                        for r in (res, respaldo) if r is not None)
         nota = "; ".join(x for x in (res.note, detalle, res.limitation) if x) or None
+        if completo and insertadas == 0:
+            self.ledger.finish(gap.id, "partial", source=res.source, rows=0,
+                               note=(nota + "; el hueco se declara cubierto pero no se "
+                                     "insertaron filas nuevas (posible paginacion repetida)")
+                               .strip("; "))
+            return "parciales"
         if completo:
             fuente = res.source if self._cubre(gap, res) and res.limitation is None \
                 else respaldo.source

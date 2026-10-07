@@ -403,3 +403,7 @@ anterior marcaba el rango entero cubierto en cuanto llegaba "alguna fila", con l
 servir (o inexistente) producía huecos rotos con apariencia de cerrados. Ahora la cobertura solo
 se declara si se leyeron **todos** los días pedidos, y si falta alguno va en `limitation`, que
 impide `repaired` por construcción.
+
+### D6. Bitget trades por REST: no soportado, sin prioridad
+Bitget `fills-history` tiene paginado no trivial: al usar `startTime/endTime` junto a otros parámetros, el cursor no avanza en algunos casos (se repiten las mismas páginas). Se han medido llamadas reales y, por decisión del usuario, no se invierte tiempo en arreglarlo ahora.
+Los huecos afectos permanecen `partial` con nota explícita. El WS sigue capturando trades. Prioridad: baja.
