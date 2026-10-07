@@ -483,6 +483,8 @@ devolvia `desconocido` en todos los reportes y la trazabilidad del ensayo se per
 |---|---|
 | `bt run --split dev` completo (45 combos + 200 aleatorias + robustez + reporte) | **127 s** |
 | carga de datos (ohlcv+funding, 4 años) | 1,9 s |
+| ventana completa 3.552.480 barras: carga + 45 combos + 200 aleatorias | **232,8 s** |
+|   de los cuales: carga 2,1 s / rejilla 67,0 s / aleatorias 159,9 s | |
 | una combinacion (target + motor) | 0,82 s |
 | rejilla de **1.000 combinaciones**, 3 workers | **819 s (13,7 min)** |
 | `bt rerun` (repite todo y compara) | ~130 s |
