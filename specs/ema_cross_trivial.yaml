@@ -1,0 +1,15 @@
+name: ema_cross_trivial
+family_id: ema_cross_trivial
+hypothesis: "Cruce EMA rápido/lento es ruido tras costes+funding en BTC 1m (ruido de mercado, sin ineficiencia estable)."
+costs:
+  fee_taker_bps: 5.0
+  slippage_bps: 2.0
+split:
+  dev_start: "2020-01-01"
+  dev_end: "2023-12-31"
+  val_start: "2024-01-01"
+  val_end: "2024-12-31"
+holdout: "2025-01-01.."
+params:
+  fast: 9
+  slow: 21
