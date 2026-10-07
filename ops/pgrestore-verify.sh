@@ -19,9 +19,15 @@ set -euo pipefail
 PSQL()  { docker-compose exec -T tsdb psql -U marketdata -q "$@" < /dev/null; }
 PSQLA() { docker-compose exec -T tsdb psql -U marketdata -At "$@" < /dev/null; }
 
+LOG="${HOME}/.local/log/pgrestore-verify.log"
+mkdir -p "$(dirname "$LOG")"
+exec > >(tee -a "$LOG") 2>&1
+
 FICHERO="${1:-$(ls -t "${HOME}"/.local/pgbackups/marketdata_*.dump.gz 2>/dev/null | head -1)}"
 [ -n "$FICHERO" ] || { echo "no hay volcados en ~/.local/pgbackups"; exit 2; }
 [ -f "$FICHERO" ] || { echo "no existe: $FICHERO"; exit 2; }
+
+echo "=== $(date -u +%FT%TZ) volcado=${FICHERO}"
 
 # marketdata_TS.dump.gz -> marketdata_TS.dump.counts.{before,after}
 RAIZ="${FICHERO%.gz}"
